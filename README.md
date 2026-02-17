@@ -187,7 +187,9 @@ Tests rely on the built-in dummy responses, so no API key is necessary. Linting 
 
 If you use GABRIEL in your research, please cite:
 
-> The Generalized Attribute Based Ratings Information Extraction Library (GABRIEL). Hemanth Asirvatham and Elliott Mokski (2026). <https://github.com/openai/GABRIEL>
+- Asirvatham, H., Mokski, E., and Shleifer, A. (2026). *GPT as a Measurement Tool*. NBER Working Paper No. 34834.
+
+- Asirvatham, H. and Mokski, E. (2026). *GABRIEL: Generalized Attribute-Based Ratings Information Extraction Library* (software). GitHub repository: https://github.com/openai/GABRIEL
 
 ## License
 
