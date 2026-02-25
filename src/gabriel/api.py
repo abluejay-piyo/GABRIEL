@@ -2,6 +2,7 @@ import os
 import re
 import warnings
 import pandas as pd
+from pathlib import Path
 from typing import Awaitable, Callable, Dict, Optional, Union, Any, List, Mapping, Sequence
 
 from .tasks import (
@@ -76,6 +77,22 @@ def _load_cached_dataframe(
     *,
     task_name: str,
 ) -> pd.DataFrame:
+    def _find_split_parts(path: str) -> List[Path]:
+        target = Path(path)
+        stem = target.stem
+        suffix = target.suffix
+        pattern = re.compile(rf"^{re.escape(stem)}_(\d+){re.escape(suffix)}$")
+        matches: List[tuple[int, Path]] = []
+        try:
+            for candidate in target.parent.glob(f"{stem}_*{suffix}"):
+                match = pattern.match(candidate.name)
+                if not match:
+                    continue
+                matches.append((int(match.group(1)), candidate))
+        except Exception:
+            return []
+        return [path for _, path in sorted(matches, key=lambda item: item[0])]
+
     if not final_path:
         raise ValueError(
             f"{task_name} does not have a cached final output file; "
@@ -86,6 +103,16 @@ def _load_cached_dataframe(
             f"[API] df is None for {task_name}; loading cached results from {final_path}."
         )
         return pd.read_csv(final_path)
+
+    split_parts = _find_split_parts(final_path)
+    if split_parts:
+        print(
+            f"[API] df is None for {task_name}; loading cached split results from "
+            f"{len(split_parts)} files with base {final_path}."
+        )
+        frames = [pd.read_csv(part) for part in split_parts]
+        return pd.concat(frames, ignore_index=True)
+
     raise FileNotFoundError(
         f"{task_name} cached output not found at {final_path}. "
         "Provide a DataFrame to compute results."
