@@ -2793,6 +2793,44 @@ def _should_cancel_inflight_task(
     return now - start_time > limit
 
 
+def _collect_successful_time_taken_samples(
+    df: pd.DataFrame, *, success_mask: Optional[pd.Series] = None
+) -> List[float]:
+    """Return numeric ``Time Taken`` samples suitable for timeout planning."""
+
+    if df.empty or "Time Taken" not in df.columns:
+        return []
+    times = pd.to_numeric(df["Time Taken"], errors="coerce")
+    if success_mask is not None:
+        with contextlib.suppress(Exception):
+            times = times[success_mask]
+    times = times[np.isfinite(times) & (times > 0)]
+    return times.astype(float).tolist()
+
+
+def _compute_dynamic_timeout_from_samples(
+    durations: List[float],
+    *,
+    timeout_factor: float,
+    max_timeout: float,
+) -> Optional[Tuple[float, float]]:
+    """Compute ``(timeout, p90)`` from observed successful durations."""
+
+    if not durations:
+        return None
+    cleaned: List[float] = []
+    for duration in durations:
+        with contextlib.suppress(Exception):
+            value = float(duration)
+            if math.isfinite(value) and value > 0:
+                cleaned.append(value)
+    if not cleaned:
+        return None
+    p90 = float(np.percentile(cleaned, 90))
+    timeout = min(max_timeout, timeout_factor * p90)
+    return timeout, p90
+
+
 def _normalize_response_result(result: Any) -> Tuple[List[Any], Optional[float], List[Any]]:
     """Normalize outputs from ``response_fn`` into ``(responses, duration, raw)``."""
 
@@ -3493,6 +3531,7 @@ async def get_all_responses(
             except Exception:
                 pass
     csv_header_written = os.path.exists(save_path) and not reset_files and os.path.getsize(save_path) > 0
+    checkpoint_success_durations: List[float] = []
     if os.path.exists(save_path) and not reset_files:
         if message_verbose:
             print(f"Reading from existing files at {save_path}...")
@@ -3537,8 +3576,13 @@ async def get_all_responses(
             )
             success_mask = success_mask | string_mask
             done = set(df.loc[success_mask, "Identifier"].astype(str))
+            checkpoint_success_durations = _collect_successful_time_taken_samples(
+                df,
+                success_mask=success_mask,
+            )
         else:
             done = set(df["Identifier"].astype(str))
+            checkpoint_success_durations = _collect_successful_time_taken_samples(df)
         if message_verbose:
             print(f"Loaded {len(df):,} rows; {len(done):,} already marked complete.")
     else:
@@ -3615,14 +3659,14 @@ async def get_all_responses(
                 "Batch mode is not supported for audio inputs; falling back to non-batch processing."
             )
         use_batch = False
-    # Warn the user if the input dataset is very large.  Processing more
-    # than 50,000 prompts in a single run can lead to very long execution
-    # times and increased risk of rate‑limit throttling.  We still proceed
-    # with the run, but advise the user to split the input into smaller
-    # batches when possible.
-    if len(todo_pairs) > 50_000:
+    # Warn the user if the input dataset is very large. Processing more
+    # than 100,000 prompts in one run can take a long time and may increase
+    # the chance of throttling or timeout retries.
+    if len(todo_pairs) > 100_000:
         logger.warning(
-            f"You are attempting to process {len(todo_pairs):,} prompts in one go. For better performance and reliability, we recommend splitting jobs into 50k‑row chunks or fewer."
+            "Large run detected (%s prompts). If you encounter API or timeout issues, "
+            "try splitting the job into ~100k-row chunks and rerunning from checkpoints.",
+            f"{len(todo_pairs):,}",
         )
     show_example_prompt = bool(print_example_prompt and not quiet)
     prompt_list = [p for p, _ in todo_pairs]
@@ -4316,7 +4360,7 @@ async def get_all_responses(
     if not use_batch and manage_rate_limits:
         req_lim = AsyncLimiter(allowed_req_pm, 60)
         tok_lim = AsyncLimiter(allowed_tok_pm, 60)
-    success_times: List[float] = []
+    success_times: List[float] = list(checkpoint_success_durations)
     timeout_initialized = False
     observed_latency_p90 = float("inf")
     inflight: Dict[str, Tuple[float, asyncio.Task, float]] = {}
@@ -4333,6 +4377,28 @@ async def get_all_responses(
             )
         ),
     )
+    if dynamic_timeout and len(success_times) >= samples_for_timeout:
+        timeout_stats = _compute_dynamic_timeout_from_samples(
+            success_times,
+            timeout_factor=timeout_factor,
+            max_timeout=max_timeout_val,
+        )
+        if timeout_stats is not None:
+            nonlocal_timeout, observed_latency_p90 = timeout_stats
+            timeout_initialized = True
+            timeout_display = (
+                "inf" if math.isinf(nonlocal_timeout) else f"{nonlocal_timeout:.1f}s"
+            )
+            p90_display = (
+                "inf" if math.isinf(observed_latency_p90) else f"{observed_latency_p90:.1f}s"
+            )
+            msg = (
+                "[dynamic timeout] Resuming from checkpoint with "
+                f"{len(success_times)} prior successful timings; initialized timeout to "
+                f"{timeout_display} (p90={p90_display}, factor={timeout_factor:.2f})."
+            )
+            print(msg)
+            logger.info(msg)
     queue: asyncio.Queue[Tuple[str, str, int]] = asyncio.Queue()
     for item in todo_pairs:
         queue.put_nowait((item[0], item[1], max_retries))
@@ -4947,9 +5013,15 @@ async def get_all_responses(
         if len(success_times) < samples_for_timeout:
             return
         try:
-            p90 = float(np.percentile(success_times, 90))
+            timeout_stats = _compute_dynamic_timeout_from_samples(
+                success_times,
+                timeout_factor=timeout_factor,
+                max_timeout=max_timeout_val,
+            )
+            if timeout_stats is None:
+                return
+            new_timeout, p90 = timeout_stats
             observed_latency_p90 = p90
-            new_timeout = min(max_timeout_val, timeout_factor * p90)
             if math.isinf(nonlocal_timeout):
                 nonlocal_timeout = new_timeout
                 if not timeout_initialized:

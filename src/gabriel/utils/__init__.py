@@ -26,7 +26,7 @@ from .word_matching import (
 )
 from .prompt_utils import swap_circle_square
 from .modality_utils import warn_if_modality_mismatch
-from .file_utils import load
+from .file_utils import load, save_dataframe_with_fallback
 
 __all__ = [
     "get_response",
@@ -61,4 +61,5 @@ __all__ = [
     "swap_circle_square",
     "warn_if_modality_mismatch",
     "load",
+    "save_dataframe_with_fallback",
 ]

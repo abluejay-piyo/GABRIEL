@@ -20,6 +20,7 @@ from ..utils import (
     warn_if_modality_mismatch,
 )
 from ..utils.logging import announce_prompt_rendering
+from ..utils.file_utils import save_dataframe_with_fallback
 from ._attribute_utils import load_persisted_attributes
 
 
@@ -175,7 +176,7 @@ class Extract:
             result["entity_name"] = pd.NA
             for attr in self.cfg.attributes.keys():
                 result[attr] = pd.NA
-            result.to_csv(out_path, index=False)
+            save_dataframe_with_fallback(result, out_path, index=False, label="Extract")
             return result
 
         attr_items = list(self.cfg.attributes.items())
@@ -358,7 +359,12 @@ class Extract:
             disagg_path = os.path.join(
                 self.cfg.save_dir, f"{base_name}_full_disaggregated.csv"
             )
-            full_df.to_csv(disagg_path, index_label=["id", "entity_name", "run"])
+            save_dataframe_with_fallback(
+                full_df,
+                disagg_path,
+                index=True,
+                label="Extract",
+            )
 
         def _pick_first(s: pd.Series) -> str:
             for val in s.dropna():
@@ -403,7 +409,7 @@ class Extract:
             final_order.extend(remaining)
         result = result[final_order]
 
-        result.to_csv(out_path, index=False)
+        save_dataframe_with_fallback(result, out_path, index=False, label="Extract")
 
         result = result.replace("unknown", pd.NA)
 
@@ -427,7 +433,7 @@ class Extract:
                 coerced[col] = conv
                 fail_logs[col] = int((non_null & conv.isna()).sum())
             coerced_path = os.path.join(self.cfg.save_dir, f"{base_name}_cleaned_coerced.csv")
-            coerced.to_csv(coerced_path, index=False)
+            save_dataframe_with_fallback(coerced, coerced_path, index=False, label="Extract")
             for col, n_fail in fail_logs.items():
                 print(f"[Extract] Failed to coerce {n_fail} values in column '{col}'.")
             result = coerced

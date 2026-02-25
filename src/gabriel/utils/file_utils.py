@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import os
 from typing import Any, Dict, Iterable, List, Optional, Set
 
@@ -55,6 +56,91 @@ AUDIO_EXTENSIONS = {
 IMAGE_EXTENSION_SUFFIXES = {ext.lstrip(".") for ext in IMAGE_EXTENSIONS}
 AUDIO_EXTENSION_SUFFIXES = {ext.lstrip(".") for ext in AUDIO_EXTENSIONS}
 PDF_EXTENSION_SUFFIXES = {ext.lstrip(".") for ext in PDF_EXTENSIONS}
+
+
+def save_dataframe_with_fallback(
+    df: pd.DataFrame,
+    path: str,
+    *,
+    index: bool = False,
+    chunk_size: int = 100_000,
+    label: Optional[str] = None,
+) -> List[str]:
+    """Persist ``df`` to CSV, falling back to chunked files on failure.
+
+    The function first attempts to save to ``path``. If that fails (for example
+    due to very large output files), it retries by splitting the DataFrame into
+    ``chunk_size`` row chunks and writing ``<stem>_1.csv``, ``<stem>_2.csv``,
+    and so on. Failures are logged and surfaced via console messages, but never
+    raised, so callers can continue returning the in-memory DataFrame.
+
+    Returns
+    -------
+    list[str]
+        Paths that were successfully written. An empty list indicates all save
+        attempts failed.
+    """
+
+    resolved_path = os.path.expandvars(os.path.expanduser(path))
+    prefix = f"[{label}] " if label else ""
+    try:
+        parent = os.path.dirname(resolved_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except Exception:
+        logger.debug("Could not ensure parent directory for %s", resolved_path)
+
+    try:
+        df.to_csv(resolved_path, index=index)
+        return [resolved_path]
+    except Exception as primary_exc:
+        print(
+            f"{prefix}Unable to save final CSV to {resolved_path}. "
+            "Trying chunked backup files (100k rows each)."
+        )
+        logger.warning(
+            "Failed to save CSV to %s; attempting chunked backup files.",
+            resolved_path,
+            exc_info=primary_exc,
+        )
+
+    try:
+        chunk = max(1, int(chunk_size))
+    except Exception:
+        chunk = 100_000
+    stem, ext = os.path.splitext(resolved_path)
+    ext = ext or ".csv"
+    total_rows = len(df)
+    part_count = max(1, int(math.ceil(total_rows / max(1, chunk))))
+    saved_paths: List[str] = []
+    try:
+        for idx in range(part_count):
+            start = idx * chunk
+            stop = start + chunk
+            part_path = f"{stem}_{idx + 1}{ext}"
+            df.iloc[start:stop].to_csv(part_path, index=index)
+            saved_paths.append(part_path)
+    except Exception as split_exc:
+        print(
+            f"{prefix}Final DataFrame could not be saved to disk. "
+            "Returning the DataFrame in memory only."
+        )
+        logger.warning(
+            "Chunked CSV fallback failed for %s.",
+            resolved_path,
+            exc_info=split_exc,
+        )
+        return []
+
+    print(
+        f"{prefix}Saved fallback split files ({part_count} part(s)) with base path {stem}_*.{ext.lstrip('.')}"
+    )
+    logger.warning(
+        "Saved chunked CSV fallback for %s into %d part(s).",
+        resolved_path,
+        part_count,
+    )
+    return saved_paths
 
 
 def load(

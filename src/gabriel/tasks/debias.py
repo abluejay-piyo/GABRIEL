@@ -26,6 +26,7 @@ from .extract import Extract, ExtractConfig
 from .paraphrase import Paraphrase, ParaphraseConfig
 from .rank import Rank, RankConfig
 from .rate import Rate, RateConfig
+from ..utils.file_utils import save_dataframe_with_fallback
 try:  # statsmodels is optional; fall back to a lightweight solver if missing
     from ..utils.plot_utils import fit_ols as _fit_ols
     from ..utils.plot_utils import regression_plot as _regression_plot
@@ -571,7 +572,7 @@ class DebiasPipeline:
 
         results_df = df_master.reset_index(drop=True)
         results_path = metadata["result_path"]
-        results_df.to_csv(results_path, index=False)
+        save_dataframe_with_fallback(results_df, results_path, index=False, label="Debias")
         if self.cfg.verbose:
             print(f"[Debias] Results saved to {results_path}")
 

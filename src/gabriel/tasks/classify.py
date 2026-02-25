@@ -21,6 +21,7 @@ from ..utils import (
     warn_if_modality_mismatch,
 )
 from ..utils.logging import announce_prompt_rendering
+from ..utils.file_utils import save_dataframe_with_fallback
 from ._attribute_utils import load_persisted_attributes
 
 
@@ -499,7 +500,12 @@ class Classify:
             disagg_path = os.path.join(
                 self.cfg.save_dir, f"{base_name}_full_disaggregated.csv"
             )
-            full_df.to_csv(disagg_path, index_label=index_cols)
+            save_dataframe_with_fallback(
+                full_df,
+                disagg_path,
+                index=True,
+                label="Classify",
+            )
 
         # aggregate across runs using a minimum frequency threshold
         def _min_freq(s: pd.Series) -> Optional[bool]:
@@ -552,7 +558,12 @@ class Classify:
 
         result_to_save = result.copy()
         result_to_save["predicted_classes"] = result_to_save["predicted_classes"].apply(json.dumps)
-        result_to_save.to_csv(out_path, index=False)
+        save_dataframe_with_fallback(
+            result_to_save,
+            out_path,
+            index=False,
+            label="Classify",
+        )
 
         # keep raw response files for reference
 
