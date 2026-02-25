@@ -27,6 +27,7 @@ from ..utils import (
     warn_if_modality_mismatch,
 )
 from ..utils.logging import announce_prompt_rendering
+from ..utils.file_utils import save_dataframe_with_fallback
 
 
 @dataclass
@@ -1018,7 +1019,7 @@ class Codify:
                 ]
 
         output_path = os.path.join(self.cfg.save_dir, "coded_passages.csv")
-        df_proc.to_csv(output_path, index=False)
+        save_dataframe_with_fallback(df_proc, output_path, index=False, label="Codify")
 
         if self.cfg.debug_print:
             print(f"\n[DEBUG] Processing complete. Results saved to: {self.cfg.save_dir}")

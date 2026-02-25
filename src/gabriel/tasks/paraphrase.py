@@ -18,6 +18,7 @@ from ..utils import (
     warn_if_modality_mismatch,
 )
 from ..utils.logging import announce_prompt_rendering
+from ..utils.file_utils import save_dataframe_with_fallback
 
 # Import classifier utilities for recursive validation.  Importing from
 # ``gabriel.tasks.classify`` does not introduce a circular dependency
@@ -294,7 +295,7 @@ class Paraphrase:
             self.cfg.save_dir,
             f"{os.path.splitext(self.cfg.file_name)[0]}_cleaned.csv",
         )
-        df_proc.to_csv(out_path, index=False)
+        save_dataframe_with_fallback(df_proc, out_path, index=False, label="Paraphrase")
         return df_proc
 
     async def _recursive_validate(

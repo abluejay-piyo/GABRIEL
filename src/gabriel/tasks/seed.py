@@ -16,6 +16,7 @@ from gabriel.tasks.deduplicate import Deduplicate, DeduplicateConfig
 from gabriel.utils import safest_json
 from gabriel.utils.openai_utils import get_all_responses
 from gabriel.utils.logging import announce_prompt_rendering
+from gabriel.utils.file_utils import save_dataframe_with_fallback
 
 
 @dataclass
@@ -303,7 +304,7 @@ class Seed:
         df["source_batch"] = df.index // max(self.cfg.entities_per_generation, 1)
         df["source_identifier"] = ["seed" for _ in range(len(entities))]
         final_path = os.path.join(self.cfg.save_dir, self.cfg.file_name)
-        df.to_csv(final_path, index=False)
+        save_dataframe_with_fallback(df, final_path, index=False, label="Seed")
         print(
             f"[Seed] Generated {len(df)} entities. Saved aggregated seeds to {final_path}."
         )

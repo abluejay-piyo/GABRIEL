@@ -15,6 +15,7 @@ from ..core.prompt_template import PromptTemplate, resolve_template
 from ..utils import safest_json
 from ..utils.openai_utils import get_all_responses
 from ..utils.logging import announce_prompt_rendering
+from ..utils.file_utils import save_dataframe_with_fallback
 
 
 # ────────────────────────────
@@ -308,5 +309,5 @@ class Deidentifier:
 
         df_proc["mapping"] = mappings_col
         df_proc["deidentified_text"] = deidentified_texts
-        df_proc.to_csv(csv_path, index=False)
+        save_dataframe_with_fallback(df_proc, str(csv_path), index=False, label="Deidentify")
         return df_proc

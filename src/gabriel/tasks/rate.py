@@ -24,6 +24,7 @@ from ..utils import (
     warn_if_modality_mismatch,
 )
 from ..utils.logging import announce_prompt_rendering
+from ..utils.file_utils import save_dataframe_with_fallback
 from ._attribute_utils import load_persisted_attributes
 
 
@@ -328,7 +329,12 @@ class Rate:
             disagg_path = os.path.join(
                 self.cfg.save_dir, f"{base_name}_full_disaggregated.csv"
             )
-            full_df.to_csv(disagg_path, index_label=["id", "run"])
+            save_dataframe_with_fallback(
+                full_df,
+                disagg_path,
+                index=True,
+                label="Rate",
+            )
 
         # aggregate across runs
         agg_df = full_df.groupby("id")[list(self.cfg.attributes)].mean()
@@ -336,7 +342,7 @@ class Rate:
         out_path = os.path.join(self.cfg.save_dir, f"{base_name}_cleaned.csv")
         result = df_proc.merge(agg_df, left_on="_gid", right_index=True, how="left")
         result = result.drop(columns=["_gid"])
-        result.to_csv(out_path, index=False)
+        save_dataframe_with_fallback(result, out_path, index=False, label="Rate")
 
         # keep raw response files for reference
 
