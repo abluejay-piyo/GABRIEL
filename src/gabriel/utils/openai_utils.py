@@ -3034,6 +3034,7 @@ async def get_all_responses(
     print_example_prompt: bool = True,
     save_path: str = "responses.csv",
     reset_files: bool = False,
+    skip_tail_fails: bool = True,
     # Maximum number of parallel worker tasks to spawn.  This value
     # represents a ceiling; the actual number of concurrent requests
     # will be adjusted downward based on your API rate limits and
@@ -3084,6 +3085,13 @@ async def get_all_responses(
     writes partial results to disk so interrupted runs can be resumed.
     The API base URL can be overridden per call via ``base_url`` or globally
     with the ``OPENAI_BASE_URL`` environment variable.
+
+    Resume behavior can be tuned with ``skip_tail_fails`` (default ``True``).
+    When a checkpoint already contains all requested rows and only a tiny tail
+    remains incomplete (up to the rounded 0.01% threshold), the helper skips
+    retriggering those rows and returns the checkpoint as-is.  Set
+    ``skip_tail_fails=False`` to preserve the previous behavior and retry every
+    incomplete row on resume.
 
     When no ``max_output_tokens`` cutoff is supplied, the helper assumes each
     response will contain roughly ``estimated_output_tokens_per_prompt`` tokens
@@ -3530,13 +3538,16 @@ async def get_all_responses(
                     os.remove(p)
             except Exception:
                 pass
+    loaded_from_checkpoint = os.path.exists(save_path) and not reset_files
+    checkpoint_identifiers: Set[str] = set()
     csv_header_written = os.path.exists(save_path) and not reset_files and os.path.getsize(save_path) > 0
     checkpoint_success_durations: List[float] = []
-    if os.path.exists(save_path) and not reset_files:
+    if loaded_from_checkpoint:
         if message_verbose:
             print(f"Reading from existing files at {save_path}...")
         df = pd.read_csv(save_path)
         df = df.drop_duplicates(subset=["Identifier"], keep="last")
+        checkpoint_identifiers = set(df["Identifier"].astype(str))
         df["Response"] = df["Response"].apply(_de)
         if "Error Log" in df.columns:
             df["Error Log"] = df["Error Log"].apply(_de)
@@ -3603,6 +3614,7 @@ async def get_all_responses(
         df = pd.DataFrame(columns=cols)
         done = set()
     written_identifiers: Set[str] = set(df["Identifier"].astype(str)) if not df.empty else set()
+    requested_identifiers = [str(i) for i in identifiers]
     # Helper to calculate and report final run cost
     def _report_cost() -> None:
         nonlocal df
@@ -3632,6 +3644,29 @@ async def get_all_responses(
         logger.info(msg)
     # Filter prompts/identifiers based on what is already completed
     todo_pairs = [(p, i) for p, i in zip(prompts, identifiers) if str(i) not in done]
+    if (
+        skip_tail_fails
+        and loaded_from_checkpoint
+        and todo_pairs
+        and requested_identifiers
+        and all(ident in checkpoint_identifiers for ident in requested_identifiers)
+    ):
+        total_rows = len(requested_identifiers)
+        failed_rows = len(todo_pairs)
+        max_tail_fail_rows = max(0, int(math.floor((total_rows * 0.0001) + 0.5)))
+        if failed_rows <= max_tail_fail_rows:
+            msg = (
+                "[checkpoint resume] All requested rows were found in the checkpoint, "
+                f"but {failed_rows:,}/{total_rows:,} rows were not marked complete. "
+                "Because skip_tail_fails=True and this is within the rounded 0.01% "
+                "tail-failure allowance, these rows were not reprocessed. "
+                "Set skip_tail_fails=False to retry them."
+            )
+            if not quiet:
+                print(msg)
+            logger.warning(msg)
+            _report_cost()
+            return df
     if not todo_pairs:
         _report_cost()
         return df
@@ -6136,6 +6171,7 @@ async def get_all_responses(
             print_example_prompt=print_example_prompt,
             save_path=save_path,
             reset_files=False,
+            skip_tail_fails=skip_tail_fails,
             n_parallels=n_parallels,
             ramp_up_seconds=ramp_up_seconds,
             ramp_up_start_fraction=ramp_up_start_fraction,
