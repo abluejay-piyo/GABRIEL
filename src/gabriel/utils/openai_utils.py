@@ -2247,6 +2247,168 @@ def response_to_text(value: Any) -> str:
     return str(value).strip()
 
 
+
+def _find_split_pickle_parts(path: str) -> List[Path]:
+    """Return sorted split pickle parts matching ``<stem>_<n><suffix>``."""
+
+    target = Path(os.path.expandvars(os.path.expanduser(path)))
+    suffix = target.suffix or ".pkl"
+    stem = target.stem
+    pattern = re.compile(rf"^{re.escape(stem)}_(\d+){re.escape(suffix)}$")
+    matches: List[tuple[int, Path]] = []
+    parent = target.parent
+    if not parent.exists():
+        return []
+    for candidate in parent.glob(f"{stem}_*{suffix}"):
+        match = pattern.match(candidate.name)
+        if not match:
+            continue
+        with contextlib.suppress(Exception):
+            matches.append((int(match.group(1)), candidate))
+    return [part for _, part in sorted(matches, key=lambda item: item[0])]
+
+
+def _remove_split_pickle_parts(path: str) -> None:
+    """Best-effort deletion of split pickle parts for ``path``."""
+
+    for part in _find_split_pickle_parts(path):
+        with contextlib.suppress(Exception):
+            part.unlink()
+
+
+def _load_embeddings_checkpoint(
+    save_path: str,
+) -> Tuple[Dict[str, List[float]], str]:
+    """Load embeddings checkpoint from a primary or split pickle artifact."""
+
+    resolved = os.path.expandvars(os.path.expanduser(save_path))
+    if os.path.exists(resolved):
+        try:
+            with open(resolved, "rb") as f:
+                loaded = pickle.load(f)
+            if isinstance(loaded, dict):
+                return loaded, "primary"
+            logger.warning(
+                "Embedding checkpoint at %s did not contain a dictionary; ignoring.",
+                resolved,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to load embedding checkpoint at %s; attempting split fallback.",
+                resolved,
+                exc_info=True,
+            )
+
+    split_parts = _find_split_pickle_parts(resolved)
+    if not split_parts:
+        return {}, "none"
+
+    merged: Dict[str, List[float]] = {}
+    try:
+        for part in split_parts:
+            with open(part, "rb") as f:
+                payload = pickle.load(f)
+            if not isinstance(payload, dict):
+                raise TypeError(f"Split embedding file {part} did not contain a dictionary.")
+            merged.update(payload)
+    except Exception:
+        logger.warning(
+            "Failed to load split embedding checkpoints for %s.",
+            resolved,
+            exc_info=True,
+        )
+        return {}, "none"
+
+    return merged, "split"
+
+
+def _save_embeddings_checkpoint(
+    embeddings: Dict[str, List[float]],
+    save_path: str,
+    *,
+    split_sizes: Tuple[int, ...] = (100_000, 10_000),
+) -> List[str]:
+    """Persist embedding checkpoints, falling back to split pickle parts."""
+
+    resolved = os.path.expandvars(os.path.expanduser(save_path))
+    parent = os.path.dirname(resolved)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    try:
+        with open(resolved, "wb") as f:
+            pickle.dump(embeddings, f)
+        _remove_split_pickle_parts(resolved)
+        return [resolved]
+    except Exception as primary_exc:
+        print(
+            f"[get_all_embeddings] Unable to save checkpoint to {resolved}. "
+            "Trying split pickle files."
+        )
+        logger.warning(
+            "Failed to save embedding checkpoint to %s; trying split pickles.",
+            resolved,
+            exc_info=primary_exc,
+        )
+
+    cleaned_split_sizes: List[int] = []
+    for size in split_sizes:
+        with contextlib.suppress(Exception):
+            parsed = int(size)
+            if parsed > 0 and parsed not in cleaned_split_sizes:
+                cleaned_split_sizes.append(parsed)
+    if not cleaned_split_sizes:
+        cleaned_split_sizes = [100_000, 10_000]
+
+    items = list(embeddings.items())
+    split_failure: Optional[Exception] = None
+    stem, suffix = os.path.splitext(resolved)
+    suffix = suffix or ".pkl"
+    for split_size in cleaned_split_sizes:
+        _remove_split_pickle_parts(resolved)
+        saved_parts: List[str] = []
+        part_count = max(1, int(math.ceil(len(items) / split_size)))
+        try:
+            for idx in range(part_count):
+                start = idx * split_size
+                stop = start + split_size
+                chunk_dict = dict(items[start:stop])
+                part_path = f"{stem}_{idx + 1}{suffix}"
+                with open(part_path, "wb") as f:
+                    pickle.dump(chunk_dict, f)
+                saved_parts.append(part_path)
+        except Exception as split_exc:
+            split_failure = split_exc
+            for part_path in saved_parts:
+                with contextlib.suppress(Exception):
+                    os.remove(part_path)
+            logger.warning(
+                "Split embedding checkpoint write failed for %s at chunk size %s.",
+                resolved,
+                split_size,
+                exc_info=split_exc,
+            )
+            continue
+
+        print(
+            "[get_all_embeddings] Saved split embedding checkpoint "
+            f"({part_count} part(s), chunk_size={split_size}) with base {stem}_*.{suffix.lstrip('.')}"
+        )
+        logger.warning(
+            "Saved split embedding checkpoint for %s into %d part(s) using chunk size %d.",
+            resolved,
+            part_count,
+            split_size,
+        )
+        return saved_parts
+
+    if split_failure is not None:
+        raise OSError(
+            f"Unable to save embedding checkpoint to {resolved} using primary or split files."
+        ) from split_failure
+    raise OSError(f"Unable to save embedding checkpoint to {resolved}.")
+
+
 async def get_embedding(
     text: str,
     *,
@@ -2350,6 +2512,8 @@ async def get_all_embeddings(
     timeout: float = 30.0,
     save_every_x: int = 5000,
     use_dummy: bool = False,
+    embedding_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+    get_all_embeddings_fn: Optional[Callable[..., Awaitable[Dict[str, List[float]]]]] = None,
     dummy_embeddings: Optional[Dict[str, List[float]]] = None,
     base_url: Optional[str] = None,
     verbose: bool = True,
@@ -2388,6 +2552,15 @@ async def get_all_embeddings(
         Frequency (in processed texts) at which the pickle file is updated.
     use_dummy:
         Generate fake embeddings instead of calling the API.
+    embedding_fn:
+        Optional callable that replaces the per-text embedding request while
+        still using this function's batching, retry, and checkpointing logic.
+        The callable must accept a ``text`` argument (positional or keyword)
+        and may optionally accept arguments such as ``model`` and ``timeout``.
+    get_all_embeddings_fn:
+        Optional callable that fully replaces this helper. It must accept
+        ``texts`` and ``identifiers`` and return a mapping from identifiers to
+        embedding vectors.
     dummy_embeddings:
         Optional mapping from identifiers (or ``"*"`` for a fallback) to
         deterministic vectors used when ``use_dummy`` is ``True``.  Supplying
@@ -2412,14 +2585,155 @@ async def get_all_embeddings(
         Mapping from identifier to embedding vector.
     """
 
-    if not use_dummy:
-        _require_api_key()
     set_log_level(logging_level)
     logger = get_logger(__name__)
     base_url = base_url or os.getenv("OPENAI_BASE_URL")
 
     if identifiers is None:
         identifiers = texts
+
+    if get_all_embeddings_fn is not None:
+        if embedding_fn is not None:
+            logger.info(
+                "Both get_all_embeddings_fn and embedding_fn were supplied; "
+                "deferring to get_all_embeddings_fn and ignoring embedding_fn."
+            )
+        candidate = get_all_embeddings_fn
+        underlying_callable: Callable[..., Any] = candidate
+        if isinstance(underlying_callable, functools.partial):
+            underlying_callable = underlying_callable.func  # type: ignore[attr-defined]
+        try:
+            sig = inspect.signature(underlying_callable)
+        except (TypeError, ValueError):
+            sig = None
+        accepts_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        ) if sig is not None else True
+        param_lookup = sig.parameters if sig is not None else {}
+        if not (accepts_var_kw or "texts" in param_lookup):
+            raise TypeError("Custom get_all_embeddings_fn must accept a `texts` argument.")
+        if not (accepts_var_kw or "identifiers" in param_lookup):
+            raise TypeError("Custom get_all_embeddings_fn must accept an `identifiers` argument.")
+
+        base_kwargs: Dict[str, Any] = {}
+        for name in inspect.signature(get_all_embeddings).parameters:
+            if name in {"get_all_embeddings_fn", "get_embedding_kwargs"}:
+                continue
+            base_kwargs[name] = locals()[name]
+        extra_kwargs = dict(get_embedding_kwargs)
+        available_kwargs: Dict[str, Any] = {**extra_kwargs, **base_kwargs}
+        used_keys: Set[str] = set()
+        positional_args: List[Any] = []
+        call_kwargs: Dict[str, Any] = {}
+        if sig is not None:
+            for param in sig.parameters.values():
+                if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                    if param.name in available_kwargs:
+                        positional_args.append(available_kwargs[param.name])
+                        used_keys.add(param.name)
+                    elif param.default is inspect._empty:
+                        raise TypeError(
+                            f"Custom get_all_embeddings_fn is missing required parameter `{param.name}`."
+                        )
+                elif param.kind in (
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.KEYWORD_ONLY,
+                ):
+                    if param.name in available_kwargs:
+                        call_kwargs[param.name] = available_kwargs[param.name]
+                        used_keys.add(param.name)
+            if accepts_var_kw:
+                for key, value in available_kwargs.items():
+                    if key not in used_keys:
+                        call_kwargs[key] = value
+        else:
+            call_kwargs = available_kwargs
+
+        result = await get_all_embeddings_fn(*positional_args, **call_kwargs)
+        if not isinstance(result, dict):
+            raise TypeError("Custom get_all_embeddings_fn must return a dictionary.")
+
+        normalized: Dict[str, List[float]] = {}
+        for key, value in result.items():
+            normalized[key] = _normalize_embedding_result(value)
+        return normalized
+
+    embedding_callable = embedding_fn or get_embedding
+    underlying_callable = embedding_callable
+    if isinstance(underlying_callable, functools.partial):
+        underlying_callable = underlying_callable.func  # type: ignore[attr-defined]
+    try:
+        underlying_callable = inspect.unwrap(underlying_callable)  # type: ignore[arg-type]
+    except Exception:
+        pass
+    using_custom_embedding_fn = (
+        embedding_fn is not None and underlying_callable is not get_embedding
+    )
+    if not use_dummy and not using_custom_embedding_fn:
+        _require_api_key()
+
+    embedding_param_names: Set[str] = set()
+    embedding_accepts_var_kw = False
+    embedding_accepts_return_raw = False
+    text_call_via_keyword = False
+    if using_custom_embedding_fn:
+        try:
+            sig = inspect.signature(embedding_callable)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("Unable to inspect custom embedding_fn signature.") from exc
+        has_generic_positional_slot = False
+        has_var_positional = False
+        has_var_keyword = False
+        text_param_kind: Optional[Any] = None
+        for param in sig.parameters.values():
+            name = param.name
+            if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                has_var_positional = True
+                continue
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                embedding_accepts_var_kw = True
+                has_var_keyword = True
+                continue
+            if name == "text":
+                text_param_kind = param.kind
+                continue
+            if param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                embedding_param_names.add(name)
+            if param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.POSITIONAL_ONLY,
+            ):
+                has_generic_positional_slot = True
+        embedding_accepts_return_raw = embedding_accepts_var_kw or (
+            "return_raw" in embedding_param_names
+        )
+        text_can_be_positional = False
+        text_can_be_keyword = False
+        if text_param_kind is not None:
+            if text_param_kind == inspect.Parameter.POSITIONAL_ONLY:
+                text_can_be_positional = True
+            elif text_param_kind == inspect.Parameter.POSITIONAL_OR_KEYWORD:
+                text_can_be_positional = True
+                text_can_be_keyword = True
+            elif text_param_kind == inspect.Parameter.KEYWORD_ONLY:
+                text_can_be_keyword = True
+            elif text_param_kind == inspect.Parameter.VAR_POSITIONAL:
+                text_can_be_positional = True
+            elif text_param_kind == inspect.Parameter.VAR_KEYWORD:
+                text_can_be_keyword = True
+        else:
+            if has_generic_positional_slot or has_var_positional:
+                text_can_be_positional = True
+            if has_var_keyword:
+                text_can_be_keyword = True
+        if not text_can_be_positional and not text_can_be_keyword:
+            raise TypeError(
+                "Custom embedding_fn must accept a `text` argument as a positional or keyword parameter."
+            )
+        text_call_via_keyword = text_can_be_keyword and not text_can_be_positional
     dummy_embeddings_map: Dict[str, List[float]] = {}
     dummy_embedding_default: Optional[List[float]] = None
     if dummy_embeddings:
@@ -2435,15 +2749,17 @@ async def get_all_embeddings(
 
     save_path = os.path.expanduser(os.path.expandvars(save_path))
     embeddings: Dict[str, List[float]] = {}
-    if not reset_file and os.path.exists(save_path):
-        try:
-            with open(save_path, "rb") as f:
-                embeddings = pickle.load(f)
+    if not reset_file:
+        embeddings, checkpoint_source = _load_embeddings_checkpoint(save_path)
+        if checkpoint_source == "primary":
             print(
                 f"[get_all_embeddings] Loaded {len(embeddings)} existing embeddings from {save_path}"
             )
-        except Exception:
-            embeddings = {}
+        elif checkpoint_source == "split":
+            print(
+                "[get_all_embeddings] Loaded "
+                f"{len(embeddings)} existing embeddings from split files with base {save_path}"
+            )
 
     if len(texts) > 50_000:
         msg = (
@@ -2531,6 +2847,24 @@ async def get_all_embeddings(
                 successes_since_adjust = 0
                 rate_limit_errors_since_adjust = 0
 
+    def _build_embedding_call_kwargs(call_timeout: Optional[float]) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "timeout": call_timeout,
+            "use_dummy": use_dummy,
+            **get_embedding_kwargs,
+        }
+        if using_custom_embedding_fn:
+            if not embedding_accepts_var_kw:
+                kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key in embedding_param_names
+                }
+            if embedding_accepts_return_raw:
+                kwargs.setdefault("return_raw", True)
+        return kwargs
+
     def _log_embedding_timeout_once(message: str) -> None:
         nonlocal first_timeout_logged
         if not first_timeout_logged:
@@ -2606,37 +2940,37 @@ async def get_all_embeddings(
                         rate_limit_errors_since_adjust = 0
                         maybe_adjust_concurrency()
                         if processed % save_every_x == 0:
-                            with open(save_path, "wb") as f:
-                                pickle.dump(embeddings, f)
+                            _save_embeddings_checkpoint(embeddings, save_path)
                         pbar.update(1)
                         continue
+                call_kwargs = _build_embedding_call_kwargs(call_timeout)
+                if text_call_via_keyword:
+                    invoke_kwargs = dict(call_kwargs)
+                    invoke_kwargs["text"] = text
+                    call_coro = embedding_callable(**invoke_kwargs)
+                else:
+                    call_coro = embedding_callable(text, **call_kwargs)
                 task = asyncio.create_task(
-                    get_embedding(
-                        text,
-                        model=model,
-                        timeout=call_timeout,
-                        use_dummy=use_dummy,
-                        **get_embedding_kwargs,
-                    )
+                    call_coro
                 )
                 try:
                     if call_timeout is None:
-                        emb, _ = await task
+                        result = await task
                     else:
-                        emb, _ = await asyncio.wait_for(task, timeout=call_timeout)
+                        result = await asyncio.wait_for(task, timeout=call_timeout)
                 except asyncio.TimeoutError:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
                     raise
+                emb = _normalize_embedding_result(result)
                 embeddings[ident] = emb
                 processed += 1
                 successes_since_adjust += 1
                 rate_limit_errors_since_adjust = 0
                 maybe_adjust_concurrency()
                 if processed % save_every_x == 0:
-                    with open(save_path, "wb") as f:
-                        pickle.dump(embeddings, f)
+                    _save_embeddings_checkpoint(embeddings, save_path)
                 pbar.update(1)
             except (asyncio.TimeoutError, APITimeoutError) as e:
                 elapsed = time.time() - start
@@ -2661,8 +2995,7 @@ async def get_all_embeddings(
                     processed += 1
                     pbar.update(1)
                     if processed % save_every_x == 0:
-                        with open(save_path, "wb") as f:
-                            pickle.dump(embeddings, f)
+                        _save_embeddings_checkpoint(embeddings, save_path)
             except RateLimitError as e:
                 error_logs[ident].append(str(e))
                 _log_embedding_rate_limit_once(str(e))
@@ -2679,8 +3012,7 @@ async def get_all_embeddings(
                     processed += 1
                     pbar.update(1)
                     if processed % save_every_x == 0:
-                        with open(save_path, "wb") as f:
-                            pickle.dump(embeddings, f)
+                        _save_embeddings_checkpoint(embeddings, save_path)
             except APIConnectionError as e:
                 error_logs[ident].append(str(e))
                 _log_embedding_connection_once(str(e))
@@ -2693,8 +3025,7 @@ async def get_all_embeddings(
                     processed += 1
                     pbar.update(1)
                     if processed % save_every_x == 0:
-                        with open(save_path, "wb") as f:
-                            pickle.dump(embeddings, f)
+                        _save_embeddings_checkpoint(embeddings, save_path)
             except (
                 APIError,
                 BadRequestError,
@@ -2706,8 +3037,7 @@ async def get_all_embeddings(
                 processed += 1
                 pbar.update(1)
                 if processed % save_every_x == 0:
-                    with open(save_path, "wb") as f:
-                        pickle.dump(embeddings, f)
+                    _save_embeddings_checkpoint(embeddings, save_path)
             except Exception as e:
                 error_logs[ident].append(str(e))
                 logger.error(f"Unexpected error for {ident}: {e}")
@@ -2732,10 +3062,19 @@ async def get_all_embeddings(
             w.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
         pbar.close()
-        with open(save_path, "wb") as f:
-            pickle.dump(embeddings, f)
-        print(f"[get_all_embeddings] Completed embedding run; saved to {save_path}")
-        logger.info("[get_all_embeddings] Completed embedding run; saved to %s", save_path)
+        saved_paths = _save_embeddings_checkpoint(embeddings, save_path)
+        if len(saved_paths) == 1 and saved_paths[0] == save_path:
+            print(f"[get_all_embeddings] Completed embedding run; saved to {save_path}")
+            logger.info("[get_all_embeddings] Completed embedding run; saved to %s", save_path)
+        else:
+            print(
+                "[get_all_embeddings] Completed embedding run; "
+                f"saved split checkpoints with base {save_path}"
+            )
+            logger.info(
+                "[get_all_embeddings] Completed embedding run; saved split checkpoints with base %s",
+                save_path,
+            )
 
     return embeddings
 
@@ -2876,6 +3215,35 @@ def _normalize_response_result(result: Any) -> Tuple[List[Any], Optional[float],
     if not raw_list or (len(raw_list) == 1 and raw_list[0] is None):
         raw_list = []
     return responses_list, duration, raw_list
+
+
+def _normalize_embedding_result(result: Any) -> List[float]:
+    """Normalize outputs from ``embedding_fn`` into a numeric vector."""
+
+    embedding_obj: Any = None
+    if isinstance(result, dict):
+        embedding_obj = (
+            result.get("embedding")
+            or result.get("embeddings")
+            or result.get("vector")
+        )
+    elif isinstance(result, tuple):
+        seq = list(result)
+        embedding_obj = seq[0] if seq else None
+    else:
+        embedding_obj = result
+
+    if embedding_obj is None:
+        raise TypeError("Embedding result did not include an embedding vector.")
+
+    values = _coerce_to_list(embedding_obj)
+    if not values:
+        raise TypeError("Embedding result did not include an embedding vector.")
+
+    try:
+        return [float(value) for value in values]
+    except (TypeError, ValueError) as exc:
+        raise TypeError("Embedding vectors must be numeric.") from exc
 
 
 def _coerce_dummy_response_spec(

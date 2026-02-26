@@ -85,3 +85,54 @@ def test_mapping_dict_parsed(monkeypatch, tmp_path):
     df = pd.DataFrame({"term": ["red apple", "red apples", "banana"]})
     result = asyncio.run(task.run(df, column_name="term"))
     assert result["mapped_term"].tolist() == ["red apples", "red apples", "banana"]
+
+
+def test_deduplicate_embedding_overrides_routed(monkeypatch, tmp_path):
+    captured = {}
+
+    async def fake_get_all_embeddings(*, identifiers, embedding_fn=None, get_all_embeddings_fn=None, **kwargs):
+        captured["embedding_fn"] = embedding_fn
+        captured["get_all_embeddings_fn"] = get_all_embeddings_fn
+        captured["embedding_kwargs"] = kwargs
+        return {
+            ident: [float(idx + 1), float((idx + 1) * 2)]
+            for idx, ident in enumerate(identifiers)
+        }
+
+    async def fake_get_all_responses(*, identifiers, **kwargs):
+        captured["response_kwargs"] = kwargs
+        return pd.DataFrame({"Identifier": identifiers, "Response": ["{}"] * len(identifiers)})
+
+    monkeypatch.setattr(deduplicate, "get_all_embeddings", fake_get_all_embeddings)
+    monkeypatch.setattr(deduplicate, "get_all_responses", fake_get_all_responses)
+
+    async def custom_embedding(text: str):
+        return [float(len(text))]
+
+    async def custom_embedding_driver(texts, identifiers):
+        return {ident: [float(i)] for i, ident in enumerate(identifiers)}
+
+    cfg = DeduplicateConfig(
+        save_dir=str(tmp_path),
+        use_dummy=True,
+        use_embeddings=True,
+        group_size=2,
+        n_runs=1,
+    )
+    task = Deduplicate(cfg)
+    df = pd.DataFrame({"term": ["apple", "Apple", "banana", "BANANA", "pear"]})
+    asyncio.run(
+        task.run(
+            df,
+            column_name="term",
+            embedding_fn=custom_embedding,
+            get_all_embeddings_fn=custom_embedding_driver,
+            response_fn=custom_embedding,
+        )
+    )
+
+    assert captured["embedding_fn"] is custom_embedding
+    assert captured["get_all_embeddings_fn"] is custom_embedding_driver
+    assert "embedding_fn" not in captured["response_kwargs"]
+    assert "get_all_embeddings_fn" not in captured["response_kwargs"]
+    assert captured["response_kwargs"]["response_fn"] is custom_embedding

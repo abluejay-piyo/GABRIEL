@@ -370,6 +370,8 @@ async def seed(
     reset_files: bool = False,
     response_fn: Optional[Callable[..., Awaitable[Any]]] = None,
     get_all_responses_fn: Optional[Callable[..., Awaitable[pd.DataFrame]]] = None,
+    embedding_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+    get_all_embeddings_fn: Optional[Callable[..., Awaitable[Dict[str, List[float]]]]] = None,
     **response_kwargs: Any,
 ) -> pd.DataFrame:
     """Enforces a representative distribution / diversity of seeds.
@@ -421,6 +423,13 @@ async def seed(
         Optional callable that fully replaces :func:`gabriel.utils.openai_utils.get_all_responses`.
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
+    embedding_fn:
+        Optional callable forwarded to :func:`gabriel.utils.openai_utils.get_all_embeddings`
+        within nested deduplication. It replaces only the per-text embedding call.
+    get_all_embeddings_fn:
+        Optional callable that fully replaces
+        :func:`gabriel.utils.openai_utils.get_all_embeddings` within nested
+        deduplication. It must accept ``texts`` and ``identifiers``.
     **response_kwargs:
         Additional keyword arguments forwarded to
         :func:`gabriel.utils.openai_utils.get_all_responses`.
@@ -453,6 +462,8 @@ async def seed(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        embedding_fn=embedding_fn,
+        get_all_embeddings_fn=get_all_embeddings_fn,
         **response_kwargs,
     )
 
@@ -613,6 +624,8 @@ async def ideate(
     template_path: Optional[str] = None,
     response_fn: Optional[Callable[..., Awaitable[Any]]] = None,
     get_all_responses_fn: Optional[Callable[..., Awaitable[pd.DataFrame]]] = None,
+    embedding_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+    get_all_embeddings_fn: Optional[Callable[..., Awaitable[Dict[str, List[float]]]]] = None,
 ) -> pd.DataFrame:
     """Generates many novel scientific theories and filters the cream of the crop.
 
@@ -669,6 +682,13 @@ async def ideate(
         Optional callable that fully replaces :func:`gabriel.utils.openai_utils.get_all_responses`.
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
+    embedding_fn:
+        Optional callable forwarded to nested deduplication tasks that replaces
+        the per-text embedding call while preserving the default
+        :func:`gabriel.utils.openai_utils.get_all_embeddings` orchestration.
+    get_all_embeddings_fn:
+        Optional callable forwarded to nested deduplication tasks that fully
+        replaces :func:`gabriel.utils.openai_utils.get_all_embeddings`.
 
     Returns
     -------
@@ -703,7 +723,7 @@ async def ideate(
         cfg_kwargs["attributes"] = attributes
     cfg = IdeateConfig(**cfg_kwargs)
 
-    def _with_callable_overrides(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _with_response_overrides(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         updated = dict(payload or {})
         if response_fn is not None:
             updated.setdefault("response_fn", response_fn)
@@ -711,11 +731,19 @@ async def ideate(
             updated.setdefault("get_all_responses_fn", get_all_responses_fn)
         return updated
 
-    generation_kwargs = _with_callable_overrides(generation_kwargs)
-    rank_run_kwargs = _with_callable_overrides(rank_run_kwargs)
-    rate_run_kwargs = _with_callable_overrides(rate_run_kwargs)
-    seed_run_kwargs = _with_callable_overrides(seed_run_kwargs)
-    deduplicate_run_kwargs = _with_callable_overrides(deduplicate_run_kwargs)
+    def _with_embedding_overrides(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        updated = _with_response_overrides(payload)
+        if embedding_fn is not None:
+            updated.setdefault("embedding_fn", embedding_fn)
+        if get_all_embeddings_fn is not None:
+            updated.setdefault("get_all_embeddings_fn", get_all_embeddings_fn)
+        return updated
+
+    generation_kwargs = _with_response_overrides(generation_kwargs)
+    rank_run_kwargs = _with_response_overrides(rank_run_kwargs)
+    rate_run_kwargs = _with_response_overrides(rate_run_kwargs)
+    seed_run_kwargs = _with_embedding_overrides(seed_run_kwargs)
+    deduplicate_run_kwargs = _with_embedding_overrides(deduplicate_run_kwargs)
 
     ideator = Ideate(cfg, template_path=template_path)
     return await ideator.run(
@@ -1619,6 +1647,8 @@ async def deduplicate(
     template_path: Optional[str] = None,
     response_fn: Optional[Callable[..., Awaitable[Any]]] = None,
     get_all_responses_fn: Optional[Callable[..., Awaitable[pd.DataFrame]]] = None,
+    embedding_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+    get_all_embeddings_fn: Optional[Callable[..., Awaitable[Dict[str, List[float]]]]] = None,
     **cfg_kwargs,
 ) -> pd.DataFrame:
     """Detects conceptual duplicates. Maps all duplicates to one representative term.
@@ -1667,6 +1697,12 @@ async def deduplicate(
         Optional callable that fully replaces :func:`gabriel.utils.openai_utils.get_all_responses`.
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
+    embedding_fn:
+        Optional callable forwarded to :func:`gabriel.utils.openai_utils.get_all_embeddings`
+        that replaces only the per-text embedding call.
+    get_all_embeddings_fn:
+        Optional callable that fully replaces
+        :func:`gabriel.utils.openai_utils.get_all_embeddings`.
     **cfg_kwargs:
         Additional configuration passed to
         :class:`gabriel.tasks.deduplicate.DeduplicateConfig`.
@@ -1702,6 +1738,8 @@ async def deduplicate(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        embedding_fn=embedding_fn,
+        get_all_embeddings_fn=get_all_embeddings_fn,
     )
 
 
@@ -1731,6 +1769,8 @@ async def merge(
     template_path: Optional[str] = None,
     response_fn: Optional[Callable[..., Awaitable[Any]]] = None,
     get_all_responses_fn: Optional[Callable[..., Awaitable[pd.DataFrame]]] = None,
+    embedding_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+    get_all_embeddings_fn: Optional[Callable[..., Awaitable[Dict[str, List[float]]]]] = None,
     **cfg_kwargs,
 ) -> pd.DataFrame:
     """Creates crosswalks. Output = merged table with GPT-matched identifiers.
@@ -1787,6 +1827,12 @@ async def merge(
         Optional callable that fully replaces :func:`gabriel.utils.openai_utils.get_all_responses`.
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
+    embedding_fn:
+        Optional callable forwarded to :func:`gabriel.utils.openai_utils.get_all_embeddings`
+        that replaces only the per-text embedding call.
+    get_all_embeddings_fn:
+        Optional callable that fully replaces
+        :func:`gabriel.utils.openai_utils.get_all_embeddings`.
     **cfg_kwargs:
         Additional overrides forwarded to :class:`gabriel.tasks.merge.MergeConfig`.
 
@@ -1827,6 +1873,8 @@ async def merge(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        embedding_fn=embedding_fn,
+        get_all_embeddings_fn=get_all_embeddings_fn,
     )
 
 

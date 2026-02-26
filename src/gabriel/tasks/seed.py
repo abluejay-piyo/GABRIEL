@@ -278,6 +278,8 @@ class Seed:
         **response_kwargs: Any,
     ) -> pd.DataFrame:
         kwargs = dict(response_kwargs)
+        kwargs.pop("embedding_fn", None)
+        kwargs.pop("get_all_embeddings_fn", None)
         kwargs.setdefault("model", self.cfg.model)
         kwargs.setdefault("n_parallels", self.cfg.n_parallels)
         kwargs.setdefault("use_dummy", self.cfg.use_dummy)

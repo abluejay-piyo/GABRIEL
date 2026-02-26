@@ -1829,3 +1829,82 @@ def test_rank_resume_ignores_nan_batch_rows(tmp_path):
 
     assert "clarity" in df.columns
     assert len(df) == 2
+
+
+def test_seed_api_passes_embedding_overrides(monkeypatch, tmp_path):
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(self, **kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "entity": ["sample"],
+                "entity_id": ["entity-00000"],
+                "source_batch": [0],
+                "source_identifier": ["seed"],
+            }
+        )
+
+    monkeypatch.setattr("gabriel.api.Seed.run", fake_run)
+
+    async def custom_embedding(text: str):
+        return [float(len(text))]
+
+    async def custom_embedding_driver(texts, identifiers):
+        return {ident: [float(i)] for i, ident in enumerate(identifiers)}
+
+    result = asyncio.run(
+        gabriel.seed(
+            "Generate entities",
+            save_dir=str(tmp_path / "seed"),
+            embedding_fn=custom_embedding,
+            get_all_embeddings_fn=custom_embedding_driver,
+        )
+    )
+
+    assert len(result) == 1
+    assert captured["embedding_fn"] is custom_embedding
+    assert captured["get_all_embeddings_fn"] is custom_embedding_driver
+
+
+def test_ideate_api_routes_embedding_overrides_to_seed_and_dedup(monkeypatch, tmp_path):
+    captured: Dict[str, Any] = {}
+
+    async def fake_run(self, topic: str, **kwargs):
+        captured["topic"] = topic
+        captured.update(kwargs)
+        return pd.DataFrame({"idea_id": ["idea-00000"], "report_text": ["hello"]})
+
+    monkeypatch.setattr("gabriel.api.Ideate.run", fake_run)
+
+    async def custom_embedding(text: str):
+        return [float(len(text))]
+
+    async def custom_embedding_driver(texts, identifiers):
+        return {ident: [float(i)] for i, ident in enumerate(identifiers)}
+
+    result = asyncio.run(
+        gabriel.ideate(
+            "AI policy",
+            save_dir=str(tmp_path / "ideate"),
+            n_ideas=1,
+            evaluation_mode="none",
+            embedding_fn=custom_embedding,
+            get_all_embeddings_fn=custom_embedding_driver,
+        )
+    )
+
+    assert len(result) == 1
+    assert captured["topic"] == "AI policy"
+    assert "embedding_fn" not in captured["generation_kwargs"]
+    assert "get_all_embeddings_fn" not in captured["generation_kwargs"]
+    assert captured["seed_run_kwargs"]["embedding_fn"] is custom_embedding
+    assert (
+        captured["seed_run_kwargs"]["get_all_embeddings_fn"]
+        is custom_embedding_driver
+    )
+    assert captured["deduplicate_run_kwargs"]["embedding_fn"] is custom_embedding
+    assert (
+        captured["deduplicate_run_kwargs"]["get_all_embeddings_fn"]
+        is custom_embedding_driver
+    )

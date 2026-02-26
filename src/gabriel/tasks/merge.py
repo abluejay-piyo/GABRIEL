@@ -136,6 +136,9 @@ class Merge:
         global_short_norm_map = {self._normalize(s): s for s in short_uniques}
 
         use_embeddings = self.cfg.use_embeddings and len(long_uniques) >= self.cfg.long_list_len
+        response_kwargs = dict(kwargs)
+        embedding_fn = response_kwargs.pop("embedding_fn", None)
+        get_all_embeddings_fn = response_kwargs.pop("get_all_embeddings_fn", None)
 
         if reset_files:
             for p in Path(self.cfg.save_dir).glob("merge_groups_attempt*.json"):
@@ -153,6 +156,8 @@ class Merge:
                 save_path=os.path.join(self.cfg.save_dir, "short_embeddings.pkl"),
                 reset_file=reset_files,
                 use_dummy=self.cfg.use_dummy,
+                embedding_fn=embedding_fn,
+                get_all_embeddings_fn=get_all_embeddings_fn,
                 verbose=self.cfg.verbose,
             )
             long_emb = await get_all_embeddings(
@@ -161,6 +166,8 @@ class Merge:
                 save_path=os.path.join(self.cfg.save_dir, "long_embeddings.pkl"),
                 reset_file=reset_files,
                 use_dummy=self.cfg.use_dummy,
+                embedding_fn=embedding_fn,
+                get_all_embeddings_fn=get_all_embeddings_fn,
                 verbose=self.cfg.verbose,
             )
 
@@ -339,7 +346,7 @@ class Merge:
                     use_dummy=self.cfg.use_dummy,
                     json_mode=True,
                     reset_files=reset_files if attempt == 0 else False,
-                    **kwargs,
+                    **response_kwargs,
                 )
             else:
                 resp_df = pd.DataFrame(columns=["Identifier", "Response"])
