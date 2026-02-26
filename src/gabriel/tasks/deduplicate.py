@@ -116,6 +116,9 @@ class Deduplicate:
         uniques, groups, orig_to_rep = self._deduplicate(df_proc[column_name])
 
         use_embeddings = self.cfg.use_embeddings and len(uniques) >= self.cfg.group_size
+        response_kwargs = dict(kwargs)
+        embedding_fn = response_kwargs.pop("embedding_fn", None)
+        get_all_embeddings_fn = response_kwargs.pop("get_all_embeddings_fn", None)
 
         batches: List[List[str]] = []
         if use_embeddings:
@@ -128,6 +131,8 @@ class Deduplicate:
                 save_path=os.path.join(self.cfg.save_dir, "deduplicate_embeddings.pkl"),
                 reset_file=reset_files and run_idx == 0,
                 use_dummy=self.cfg.use_dummy,
+                embedding_fn=embedding_fn,
+                get_all_embeddings_fn=get_all_embeddings_fn,
                 verbose=self.cfg.verbose,
             )
             if emb:
@@ -184,7 +189,7 @@ class Deduplicate:
                 use_dummy=self.cfg.use_dummy,
                 json_mode=True,
                 reset_files=reset_files,
-                **kwargs,
+                **response_kwargs,
             )
         else:
             resp_df = pd.DataFrame(columns=["Identifier", "Response"])

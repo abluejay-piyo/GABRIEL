@@ -157,3 +157,65 @@ def test_merge_auto_match(mock_resp, mock_emb, tmp_path):
     merged = asyncio.run(task.run(df1, df2, on="term"))
     assert set(merged["val"].dropna()) == {1, 2}
     assert mock_resp.await_count == 0
+
+
+def test_merge_embedding_overrides_routed(monkeypatch, tmp_path):
+    captured = {}
+
+    async def fake_get_all_embeddings(*, texts, identifiers=None, embedding_fn=None, get_all_embeddings_fn=None, **kwargs):
+        captured.setdefault("embedding_calls", []).append(
+            {
+                "texts": texts,
+                "identifiers": identifiers,
+                "embedding_fn": embedding_fn,
+                "get_all_embeddings_fn": get_all_embeddings_fn,
+            }
+        )
+        mapping = {
+            "apple": [1.0, 0.0],
+            "Apple": [1.0, 0.0],
+        }
+        return {ident: mapping.get(ident, [0.0, 1.0]) for ident in identifiers}
+
+    async def fake_get_all_responses(*, identifiers, **kwargs):
+        captured["response_kwargs"] = kwargs
+        return pd.DataFrame(
+            {"Identifier": identifiers, "Response": ['{"apple": "Apple"}'] * len(identifiers)}
+        )
+
+    monkeypatch.setattr("gabriel.tasks.merge.get_all_embeddings", fake_get_all_embeddings)
+    monkeypatch.setattr("gabriel.tasks.merge.get_all_responses", fake_get_all_responses)
+
+    async def custom_embedding(text: str):
+        return [float(len(text))]
+
+    async def custom_embedding_driver(texts, identifiers):
+        return {ident: [float(i)] for i, ident in enumerate(identifiers)}
+
+    cfg = MergeConfig(
+        save_dir=str(tmp_path),
+        use_embeddings=True,
+        long_list_len=1,
+        auto_match_threshold=0.0,
+        max_attempts=1,
+    )
+    task = Merge(cfg)
+    left = pd.DataFrame({"term": ["apple"]})
+    right = pd.DataFrame({"term": ["Apple"], "val": [1]})
+    merged = asyncio.run(
+        task.run(
+            left,
+            right,
+            on="term",
+            embedding_fn=custom_embedding,
+            get_all_embeddings_fn=custom_embedding_driver,
+            response_fn=custom_embedding,
+        )
+    )
+
+    assert merged["val"].iloc[0] == 1
+    assert captured["embedding_calls"][0]["embedding_fn"] is custom_embedding
+    assert captured["embedding_calls"][0]["get_all_embeddings_fn"] is custom_embedding_driver
+    assert "embedding_fn" not in captured["response_kwargs"]
+    assert "get_all_embeddings_fn" not in captured["response_kwargs"]
+    assert captured["response_kwargs"]["response_fn"] is custom_embedding
