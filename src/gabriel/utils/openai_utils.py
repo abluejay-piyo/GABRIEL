@@ -84,6 +84,38 @@ _ESTIMATION_SAMPLE_SIZE = 5000
 
 _TIMEOUT_BURST_RATIO = 1.25
 
+# ── Google Gemini / provider routing ─────────────────────────────────────────
+# Google exposes an OpenAI-compatible REST endpoint, so the same AsyncOpenAI
+# SDK can be used for Gemini models by pointing it at Google's base URL and
+# using the ``GOOGLE_GEMINI_API_KEY`` instead of ``OPENAI_API_KEY``.
+GOOGLE_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+_GEMINI_PREFIX = "gemini-"
+
+
+def _is_gemini_model(model: str) -> bool:
+    """Return ``True`` when *model* is a Google Gemini model."""
+    return (model or "").lower().startswith(_GEMINI_PREFIX)
+
+
+def _resolve_provider(
+    model: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return ``(base_url, api_key)`` resolved for *model*.
+
+    When *model* is a ``gemini-*`` model and no explicit overrides are given,
+    the function automatically points to Google's OpenAI-compatible endpoint
+    and reads the key from the ``GOOGLE_GEMINI_API_KEY`` environment variable.
+    For all other models the supplied values (or ``None``) are returned as-is.
+    """
+    if _is_gemini_model(model):
+        resolved_url = base_url or GOOGLE_GEMINI_BASE_URL
+        resolved_key = api_key or os.getenv("GOOGLE_GEMINI_API_KEY")
+        return resolved_url, resolved_key
+    return base_url, api_key
+
+
 DEFAULT_SYSTEM_INSTRUCTION = (
     "Please provide a helpful response to this inquiry for purposes of academic research."
 )
@@ -120,8 +152,8 @@ except Exception:
 
 from gabriel.utils.parsing import parse_json_with_status, safe_json
 
-# single connection pool per process, keyed by base URL and created lazily
-_clients_async: Dict[Optional[str], openai.AsyncOpenAI] = {}
+# single connection pool per process, keyed by (base_url, api_key) and created lazily
+_clients_async: Dict[Tuple[Optional[str], Optional[str]], openai.AsyncOpenAI] = {}
 
 
 def _progress_bar(*args: Any, verbose: bool = True, **kwargs: Any):
@@ -144,20 +176,25 @@ def _display_example_prompt(example_prompt: str, *, verbose: bool = True) -> Non
 
 def _get_client(
     base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> openai.AsyncOpenAI:
-    """Return a cached ``AsyncOpenAI`` client for ``base_url``.
+    """Return a cached ``AsyncOpenAI`` client for *base_url* / *api_key*.
 
-    When ``base_url`` is ``None`` the default OpenAI endpoint is used.  A client
-    is created on first use and reused for subsequent calls with the same base
-    URL to benefit from connection pooling.
+    When ``base_url`` is ``None`` the default OpenAI endpoint is used.  Pass an
+    explicit ``api_key`` to use a provider-specific key (e.g. for Gemini).
+    Clients are cached on the ``(base_url, api_key)`` pair and reused to benefit
+    from connection pooling.
     """
 
     url = base_url or os.getenv("OPENAI_BASE_URL")
-    client = _clients_async.get(url)
+    cache_key: Tuple[Optional[str], Optional[str]] = (url, api_key)
+    client = _clients_async.get(cache_key)
     if client is None:
         kwargs: Dict[str, Any] = {}
         if url:
             kwargs["base_url"] = url
+        if api_key:
+            kwargs["api_key"] = api_key
         if httpx is not None:
             try:
                 kwargs.setdefault(
@@ -168,7 +205,7 @@ def _get_client(
                 # Fall back to the SDK default if constructing the timeout fails
                 pass
         client = openai.AsyncOpenAI(**kwargs)
-        _clients_async[url] = client
+        _clients_async[cache_key] = client
     return client
 
 # Estimated output tokens per prompt used for cost estimation when no cutoff is specified.
@@ -404,6 +441,21 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
         "output": 8.00,
         "batch": 0.5,
     },
+    # ── Google Gemini pricing (USD per million tokens, as of 2025) ────────────
+    # gemini-2.5-pro
+    "gemini-2.5-pro": {"input": 1.25, "cached_input": 0.31, "output": 10.00, "batch": 1.0},
+    # gemini-2.5-flash  (free tier available; paid tier shown here)
+    "gemini-2.5-flash": {"input": 0.15, "cached_input": 0.038, "output": 0.60, "batch": 1.0},
+    # gemini-2.0-flash
+    "gemini-2.0-flash": {"input": 0.10, "cached_input": 0.025, "output": 0.40, "batch": 1.0},
+    # gemini-2.0-flash-lite
+    "gemini-2.0-flash-lite": {"input": 0.075, "cached_input": 0.019, "output": 0.30, "batch": 1.0},
+    # gemini-1.5-pro
+    "gemini-1.5-pro": {"input": 1.25, "cached_input": 0.31, "output": 5.00, "batch": 1.0},
+    # gemini-1.5-flash
+    "gemini-1.5-flash": {"input": 0.075, "cached_input": 0.019, "output": 0.30, "batch": 1.0},
+    # gemini-flash-latest alias (resolves to current flash model)
+    "gemini-flash-latest": {"input": 0.15, "cached_input": 0.038, "output": 0.60, "batch": 1.0},
 }
 
 
@@ -877,8 +929,20 @@ def _is_multimodal_estimate(
 
 
 
-def _require_api_key() -> str:
-    """Return the API key or raise a runtime error if missing."""
+def _require_api_key(model: str = "") -> str:
+    """Return the API key or raise a runtime error if missing.
+
+    When *model* is a Gemini model the function checks for
+    ``GOOGLE_GEMINI_API_KEY``; for all other models it checks
+    ``OPENAI_API_KEY``.
+    """
+    if _is_gemini_model(model):
+        api_key = os.getenv("GOOGLE_GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GOOGLE_GEMINI_API_KEY environment variable must be set to use Gemini models."
+            )
+        return api_key
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError(
@@ -1803,9 +1867,10 @@ async def get_response(
         return dummy, 0.0
     if logging_level is not None:
         set_log_level(logging_level)
-    _require_api_key()
+    base_url, _resolved_key = _resolve_provider(model, base_url, None)
     base_url = base_url or os.getenv("OPENAI_BASE_URL")
-    client_async = _get_client(base_url)
+    _require_api_key(model)
+    client_async = _get_client(base_url, _resolved_key)
 
     try:
         poll_interval = float(background_poll_interval)
@@ -3650,7 +3715,7 @@ async def get_all_responses(
     manage_rate_limits = not using_custom_response_fn
     planning_buffer = float(min(max(planning_rate_limit_buffer, 0.1), 1.0))
     if not use_dummy and not using_custom_response_fn:
-        _require_api_key()
+        _require_api_key(model)
     _ensure_runtime_dependencies(verbose=message_verbose)
     try:
         estimated_output_tokens_per_prompt = int(
@@ -3793,6 +3858,11 @@ async def get_all_responses(
                 status_report_interval = None
     if quiet:
         status_report_interval = None
+    _provider_base_url, _provider_api_key = _resolve_provider(model, base_url, api_key)
+    if _provider_base_url:
+        base_url = _provider_base_url
+    if _provider_api_key and api_key is None:
+        api_key = _provider_api_key
     base_url = base_url or os.getenv("OPENAI_BASE_URL")
     if web_search_filters and not web_search and not get_response_kwargs.get("web_search", False):
         logger.debug(
