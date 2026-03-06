@@ -147,6 +147,9 @@ class Extract:
             item_name="attributes",
             legacy_filename=f"{base_name}_attrs.json",
         )
+
+        if not isinstance(self.cfg.n_attributes_per_run, int) or self.cfg.n_attributes_per_run < 1:
+            raise ValueError("n_attributes_per_run must be an integer >= 1")
         values = df_proc[column_name].tolist()
         texts = [str(v) for v in values]
 

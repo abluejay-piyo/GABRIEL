@@ -140,6 +140,9 @@ class Rate:
             legacy_filename=f"{base_name}_attrs.json",
         )
 
+        if not isinstance(self.cfg.n_attributes_per_run, int) or self.cfg.n_attributes_per_run < 1:
+            raise ValueError("n_attributes_per_run must be an integer >= 1")
+
         attr_items = list(self.cfg.attributes.items())
         attr_count = len(attr_items)
         if attr_count > self.cfg.n_attributes_per_run:

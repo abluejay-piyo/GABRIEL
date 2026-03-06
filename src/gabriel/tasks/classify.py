@@ -183,6 +183,9 @@ class Classify:
             legacy_filename=f"{base_name}_attrs.json",
         )
 
+        if not isinstance(self.cfg.n_attributes_per_run, int) or self.cfg.n_attributes_per_run < 1:
+            raise ValueError("n_attributes_per_run must be an integer >= 1")
+
         label_items = list(self.cfg.labels.items())
         label_count = len(label_items)
         if label_count > self.cfg.n_attributes_per_run:
