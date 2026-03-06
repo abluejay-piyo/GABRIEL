@@ -509,6 +509,50 @@ def test_get_all_responses_images_dummy(tmp_path):
     assert len(df) == 1
 
 
+def test_get_all_responses_forwards_image_detail_only_for_image_prompts(tmp_path):
+    seen = {}
+
+    async def custom(prompt: str, **kwargs):
+        seen[prompt] = kwargs.get("image_detail") if "image_detail" in kwargs else "__absent__"
+        return [prompt]
+
+    asyncio.run(
+        openai_utils.get_all_responses(
+            prompts=["with-image", "without-image"],
+            identifiers=["1", "2"],
+            prompt_images={"1": ["abcd"]},
+            image_detail="original",
+            save_path=str(tmp_path / "img_detail.csv"),
+            response_fn=custom,
+            n_parallels=1,
+        )
+    )
+
+    assert seen["with-image"] == "original"
+    assert seen["without-image"] == "__absent__"
+
+
+def test_get_all_responses_omits_image_detail_for_none_value(tmp_path):
+    seen = []
+
+    async def custom(prompt: str, **kwargs):
+        seen.append("image_detail" in kwargs)
+        return [prompt]
+
+    asyncio.run(
+        openai_utils.get_all_responses(
+            prompts=["with-image"],
+            identifiers=["1"],
+            prompt_images={"1": ["abcd"]},
+            image_detail="none",
+            save_path=str(tmp_path / "img_detail_none.csv"),
+            response_fn=custom,
+        )
+    )
+
+    assert seen == [False]
+
+
 def test_get_all_responses_audio_dummy(tmp_path):
     df = asyncio.run(
         openai_utils.get_all_responses(

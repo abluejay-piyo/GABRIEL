@@ -1442,6 +1442,23 @@ def _normalise_search_context_size(value: Optional[str]) -> str:
     return resolved
 
 
+def _normalise_image_detail(value: Optional[str]) -> Optional[str]:
+    """Normalise image-detail overrides while preserving API flexibility.
+
+    The Responses API validates allowed values (for example ``"low"`` or
+    ``"original"``).  This helper intentionally does not hard-code that list.
+    It only treats missing/blank values (including the string ``"none"``) as
+    an instruction to omit ``detail`` entirely.
+    """
+
+    if value is None:
+        return None
+    normalised = value.strip()
+    if not normalised or normalised.lower() == "none":
+        return None
+    return normalised
+
+
 def _extract_web_search_sources(raw_items: List[Any]) -> Optional[List[Any]]:
     """Retrieve any web-search sources returned in ``raw_items``."""
 
@@ -1692,6 +1709,7 @@ async def get_response(
     base_url: Optional[str] = None,
     verbose: bool = True,
     images: Optional[List[str]] = None,
+    image_detail: Optional[str] = None,
     audio: Optional[List[Dict[str, str]]] = None,
     pdfs: Optional[List[Dict[str, str]]] = None,
     return_raw: bool = False,
@@ -1760,6 +1778,9 @@ async def get_response(
         When set, progress information is printed via the module logger.
     images, audio, pdfs:
         Lists of base64-encoded media to include alongside the text prompt.
+    image_detail:
+        Optional detail override for image inputs. ``None`` (or ``"none"``)
+        omits the parameter and lets the model use its default behaviour.
     return_raw:
         If ``True`` the raw SDK response objects are returned alongside the
         extracted text and timing information.
@@ -1796,6 +1817,7 @@ async def get_response(
             "Web search cannot be combined with JSON mode; disabling JSON mode."
         )
         json_mode = False
+    normalised_image_detail = _normalise_image_detail(image_detail)
     # Use dummy for testing without calling the API
     if use_dummy:
         dummy = [f"DUMMY {prompt}" for _ in range(max(n, 1))]
@@ -2024,9 +2046,13 @@ async def get_response(
                     img_url = (
                         img if str(img).startswith("data:") else f"data:image/jpeg;base64,{img}"
                     )
-                    contents.append(
-                        {"type": "input_image", "image_url": img_url}
-                    )
+                    image_payload: Dict[str, Any] = {
+                        "type": "input_image",
+                        "image_url": img_url,
+                    }
+                    if normalised_image_detail is not None:
+                        image_payload["detail"] = normalised_image_detail
+                    contents.append(image_payload)
             if pdfs:
                 for pdf in pdfs:
                     file_data = pdf.get("file_data")
@@ -3380,6 +3406,7 @@ async def get_all_responses(
     *,
     model: str = "gpt-5-mini",
     modality: Optional[str] = None,
+    image_detail: Optional[str] = None,
     n: int = 1,
     max_output_tokens: Optional[int] = None,
     estimated_output_tokens_per_prompt: Optional[int] = ESTIMATED_OUTPUT_TOKENS_PER_PROMPT,
@@ -3551,6 +3578,10 @@ async def get_all_responses(
     Additional web search options (allowed domains and user location hints such
     as ``city``, ``country``, ``region``, ``timezone`` and ``type`` – usually
     ``"approximate"``) can be supplied together via ``web_search_filters``.
+
+    Image inputs can also include an optional ``image_detail`` override. Leave
+    this as ``None`` (or pass ``"none"``) to keep current behaviour and let the
+    model choose the default detail level.
     Per-identifier overrides can be passed through
     ``prompt_web_search_filters`` where the mapping keys correspond to prompt
     identifiers and values follow the same schema as ``web_search_filters``.
@@ -3836,6 +3867,13 @@ async def get_all_responses(
     get_response_kwargs.setdefault("temperature", temperature)
     get_response_kwargs.setdefault("reasoning_effort", reasoning_effort)
     get_response_kwargs.setdefault("reasoning_summary", reasoning_summary)
+    resolved_image_detail = _normalise_image_detail(
+        get_response_kwargs.get("image_detail", image_detail)
+    )
+    if resolved_image_detail is None:
+        get_response_kwargs.pop("image_detail", None)
+    else:
+        get_response_kwargs["image_detail"] = resolved_image_detail
     # Pass the chosen model through to get_response by default
     get_response_kwargs.setdefault("model", model)
     get_response_kwargs.setdefault("base_url", base_url)
@@ -4367,7 +4405,13 @@ async def get_all_responses(
                     if imgs:
                         for img in imgs:
                             img_url = img if str(img).startswith("data:") else f"data:image/jpeg;base64,{img}"
-                            contents.append({"type": "input_image", "image_url": img_url})
+                            image_payload: Dict[str, Any] = {
+                                "type": "input_image",
+                                "image_url": img_url,
+                            }
+                            if resolved_image_detail is not None:
+                                image_payload["detail"] = resolved_image_detail
+                            contents.append(image_payload)
                     if pdfs:
                         for pdf in pdfs:
                             file_data = pdf.get("file_data")
@@ -5725,6 +5769,12 @@ async def get_all_responses(
                     call_kwargs.pop("web_search_filters", None)
                 if images_payload is not None:
                     call_kwargs["images"] = images_payload
+                    if images_payload and resolved_image_detail is not None:
+                        call_kwargs["image_detail"] = resolved_image_detail
+                    else:
+                        call_kwargs.pop("image_detail", None)
+                else:
+                    call_kwargs.pop("image_detail", None)
                 if audio_payload is not None:
                     call_kwargs["audio"] = audio_payload
                 if pdf_payload is not None:
@@ -6502,6 +6552,7 @@ async def get_all_responses(
             "search_context_size",
             "reasoning_effort",
             "reasoning_summary",
+            "image_detail",
             "use_dummy",
             "response_fn",
             "get_all_responses_fn",
@@ -6531,6 +6582,7 @@ async def get_all_responses(
             search_context_size=search_context_size,
             reasoning_effort=reasoning_effort,
             reasoning_summary=reasoning_summary,
+            image_detail=image_detail,
             dummy_responses=dummy_responses,
             use_dummy=use_dummy,
             response_fn=response_fn,
