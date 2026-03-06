@@ -34,3 +34,33 @@ def test_get_response_encodes_image(monkeypatch):
         DummyClient.captured["input"][0]["content"][1]["image_url"]
         == "data:image/jpeg;base64,abc"
     )
+
+
+def test_get_response_passes_image_detail_when_provided(monkeypatch):
+    """Verify image detail is forwarded when explicitly requested."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    openai_utils.client_async = None
+    dummy = DummyClient()
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **_: dummy)
+    asyncio.run(
+        openai_utils.get_response(
+            "Describe", images=["abc"], image_detail="original", use_dummy=False
+        )
+    )
+    assert DummyClient.captured["input"][0]["content"][1]["detail"] == "original"
+
+
+def test_get_response_omits_image_detail_when_none_string(monkeypatch):
+    """Verify the string "none" suppresses detail forwarding."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    openai_utils.client_async = None
+    dummy = DummyClient()
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **_: dummy)
+    asyncio.run(
+        openai_utils.get_response(
+            "Describe", images=["abc"], image_detail="none", use_dummy=False
+        )
+    )
+    assert "detail" not in DummyClient.captured["input"][0]["content"][1]
