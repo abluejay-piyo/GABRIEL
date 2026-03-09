@@ -1,7 +1,9 @@
 import os
 import re
+import inspect
 import warnings
 import pandas as pd
+from dataclasses import fields
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, Optional, Union, Any, List, Mapping, Sequence
 
@@ -39,7 +41,7 @@ from .tasks import (
     Ideate,
     IdeateConfig,
 )
-from .utils.openai_utils import get_all_responses
+from .utils.openai_utils import get_all_responses, get_response
 from .utils.passage_viewer import view as _view_passages
 from .tasks.debias import (
     DebiasConfig,
@@ -129,6 +131,56 @@ def _debias_default_run_name(
     return f"{prefix}_{cleaned}" if cleaned else prefix
 
 
+_OPENAI_RESPONSE_OVERRIDES: frozenset[str] = frozenset(
+    {
+        *inspect.signature(get_all_responses).parameters.keys(),
+        *inspect.signature(get_response).parameters.keys(),
+    }
+    - {
+        "prompt",
+        "prompts",
+        "identifiers",
+        "prompt_images",
+        "prompt_audio",
+        "prompt_pdfs",
+        "prompt_web_search_filters",
+        "save_path",
+    }
+)
+
+
+def _split_cfg_and_response_kwargs(
+    cfg_cls: Any,
+    extra_kwargs: Dict[str, Any],
+    *,
+    task_name: str,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Split extra kwargs into config overrides and response passthrough kwargs."""
+
+    cfg_fields = {field.name for field in fields(cfg_cls)}
+    cfg_overrides: Dict[str, Any] = {}
+    response_overrides: Dict[str, Any] = {}
+    unknown_keys: List[str] = []
+
+    for key, value in extra_kwargs.items():
+        if key in cfg_fields:
+            cfg_overrides[key] = value
+        elif key in _OPENAI_RESPONSE_OVERRIDES:
+            response_overrides[key] = value
+        else:
+            unknown_keys.append(key)
+
+    if unknown_keys:
+        unknown_display = ", ".join(sorted(unknown_keys))
+        raise TypeError(
+            f"Unknown keyword argument(s) for gabriel.{task_name}: {unknown_display}. "
+            "Pass task configuration keys, or OpenAI response kwargs such as "
+            "`image_detail` / `max_output_tokens`."
+        )
+
+    return cfg_overrides, response_overrides
+
+
 async def rate(
     df: Optional[pd.DataFrame],
     column_name: str,
@@ -205,7 +257,7 @@ async def rate(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Additional overrides applied to :class:`gabriel.tasks.rate.RateConfig`.
+        Additional overrides applied to :class:`gabriel.tasks.rate.RateConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -219,6 +271,11 @@ async def rate(
         base_name = os.path.splitext(file_name)[0]
         final_path = os.path.join(save_dir, f"{base_name}_cleaned.csv")
         return _load_cached_dataframe(final_path, task_name="Rate")
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        RateConfig,
+        dict(cfg_kwargs),
+        task_name="rate",
+    )
     cfg = RateConfig(
         attributes=attributes,
         save_dir=save_dir,
@@ -239,6 +296,7 @@ async def rate(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
 async def extract(
@@ -314,7 +372,7 @@ async def extract(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Additional overrides forwarded to :class:`gabriel.tasks.extract.ExtractConfig`.
+        Additional overrides forwarded to :class:`gabriel.tasks.extract.ExtractConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -328,6 +386,11 @@ async def extract(
         base_name = os.path.splitext(file_name)[0]
         final_path = os.path.join(save_dir, f"{base_name}_cleaned.csv")
         return _load_cached_dataframe(final_path, task_name="Extract")
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        ExtractConfig,
+        dict(cfg_kwargs),
+        task_name="extract",
+    )
     cfg = ExtractConfig(
         attributes=attributes,
         save_dir=save_dir,
@@ -348,6 +411,7 @@ async def extract(
         types=types,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
 
@@ -549,7 +613,7 @@ async def classify(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Extra configuration passed to :class:`gabriel.tasks.classify.ClassifyConfig`.
+        Extra configuration passed to :class:`gabriel.tasks.classify.ClassifyConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -562,6 +626,11 @@ async def classify(
         base_name = os.path.splitext(file_name)[0]
         final_path = os.path.join(save_dir, f"{base_name}_cleaned.csv")
         return _load_cached_dataframe(final_path, task_name="Classify")
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        ClassifyConfig,
+        dict(cfg_kwargs),
+        task_name="classify",
+    )
     cfg = ClassifyConfig(
         labels=labels,
         save_dir=save_dir,
@@ -586,6 +655,7 @@ async def classify(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
 
@@ -840,7 +910,7 @@ async def deidentify(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Additional overrides for :class:`gabriel.tasks.deidentify.DeidentifyConfig`.
+        Additional overrides for :class:`gabriel.tasks.deidentify.DeidentifyConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -853,6 +923,11 @@ async def deidentify(
         base_name = os.path.splitext(file_name)[0]
         final_path = os.path.join(save_dir, f"{base_name}_cleaned.csv")
         return _load_cached_dataframe(final_path, task_name="Deidentify")
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        DeidentifyConfig,
+        dict(cfg_kwargs),
+        task_name="deidentify",
+    )
     cfg = DeidentifyConfig(
         save_dir=save_dir,
         file_name=file_name,
@@ -873,6 +948,7 @@ async def deidentify(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
 async def rank(
@@ -979,7 +1055,7 @@ async def rank(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Extra parameters passed to :class:`gabriel.tasks.rank.RankConfig`.
+        Extra parameters passed to :class:`gabriel.tasks.rank.RankConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -998,6 +1074,11 @@ async def rank(
             base_name = os.path.splitext(file_name)[0]
             final_path = os.path.join(save_dir, f"{base_name}_final.csv")
         return _load_cached_dataframe(final_path, task_name="Rank")
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        RankConfig,
+        dict(cfg_kwargs),
+        task_name="rank",
+    )
     cfg = RankConfig(
         attributes=attributes,
         n_rounds=n_rounds,
@@ -1037,6 +1118,7 @@ async def rank(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
     # By default only expose the z-score columns (attribute names without suffixes)
@@ -1137,7 +1219,7 @@ async def codify(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Additional overrides passed to :class:`gabriel.tasks.codify.CodifyConfig`.
+        Additional overrides passed to :class:`gabriel.tasks.codify.CodifyConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -1149,8 +1231,12 @@ async def codify(
     if df is None:
         final_path = os.path.join(save_dir, "coded_passages.csv")
         return _load_cached_dataframe(final_path, task_name="Codify")
-    cfg_kwargs = dict(cfg_kwargs)
-    
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        CodifyConfig,
+        dict(cfg_kwargs),
+        task_name="codify",
+    )
+
     cfg = CodifyConfig(
         save_dir=save_dir,
         file_name=file_name,
@@ -1173,6 +1259,7 @@ async def codify(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
 
@@ -1258,7 +1345,7 @@ async def paraphrase(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Additional configuration passed to :class:`gabriel.tasks.paraphrase.ParaphraseConfig`.
+        Additional configuration passed to :class:`gabriel.tasks.paraphrase.ParaphraseConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -1271,6 +1358,11 @@ async def paraphrase(
         base_name = os.path.splitext(file_name)[0]
         final_path = os.path.join(save_dir, f"{base_name}_cleaned.csv")
         return _load_cached_dataframe(final_path, task_name="Paraphrase")
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        ParaphraseConfig,
+        dict(cfg_kwargs),
+        task_name="paraphrase",
+    )
     cfg = ParaphraseConfig(
         instructions=instructions,
         revised_column_name=revised_column_name,
@@ -1295,6 +1387,7 @@ async def paraphrase(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
 
@@ -1363,7 +1456,7 @@ async def compare(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Additional configuration passed to :class:`gabriel.tasks.compare.CompareConfig`.
+        Additional configuration passed to :class:`gabriel.tasks.compare.CompareConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -1376,6 +1469,11 @@ async def compare(
     os.makedirs(save_dir, exist_ok=True)
     if df is None:
         return _load_cached_dataframe(None, task_name="Compare")
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        CompareConfig,
+        dict(cfg_kwargs),
+        task_name="compare",
+    )
     cfg = CompareConfig(
         save_dir=save_dir,
         file_name=file_name,
@@ -1395,6 +1493,7 @@ async def compare(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
 
@@ -1458,7 +1557,7 @@ async def bucket(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Additional overrides forwarded to :class:`gabriel.tasks.bucket.BucketConfig`.
+        Additional overrides forwarded to :class:`gabriel.tasks.bucket.BucketConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -1472,6 +1571,11 @@ async def bucket(
     if df is None:
         final_path = os.path.join(save_dir, file_name)
         return _load_cached_dataframe(final_path, task_name="Bucket")
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        BucketConfig,
+        dict(cfg_kwargs),
+        task_name="bucket",
+    )
     cfg = BucketConfig(
         bucket_count=bucket_count,
         save_dir=save_dir,
@@ -1489,6 +1593,7 @@ async def bucket(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
 
@@ -1578,7 +1683,7 @@ async def discover(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Additional overrides passed to :class:`gabriel.tasks.discover.DiscoverConfig`.
+        Additional overrides passed to :class:`gabriel.tasks.discover.DiscoverConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -1597,6 +1702,11 @@ async def discover(
             "Discover does not persist a final output DataFrame; "
             "provide a DataFrame to run the task."
         )
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        DiscoverConfig,
+        dict(cfg_kwargs),
+        task_name="discover",
+    )
     cfg = DiscoverConfig(
         save_dir=save_dir,
         model=model,
@@ -1626,6 +1736,7 @@ async def discover(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
 
@@ -1705,7 +1816,10 @@ async def deduplicate(
         :func:`gabriel.utils.openai_utils.get_all_embeddings`.
     **cfg_kwargs:
         Additional configuration passed to
-        :class:`gabriel.tasks.deduplicate.DeduplicateConfig`.
+        :class:`gabriel.tasks.deduplicate.DeduplicateConfig`. Keys matching
+        :func:`gabriel.utils.openai_utils.get_all_responses` /
+        :func:`gabriel.utils.openai_utils.get_response` (for example
+        ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -1719,6 +1833,11 @@ async def deduplicate(
     os.makedirs(save_dir, exist_ok=True)
     if df is None:
         return _load_cached_dataframe(None, task_name="Deduplicate")
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        DeduplicateConfig,
+        dict(cfg_kwargs),
+        task_name="deduplicate",
+    )
     cfg = DeduplicateConfig(
         save_dir=save_dir,
         file_name=file_name,
@@ -1740,6 +1859,7 @@ async def deduplicate(
         get_all_responses_fn=get_all_responses_fn,
         embedding_fn=embedding_fn,
         get_all_embeddings_fn=get_all_embeddings_fn,
+        **response_kwargs,
     )
 
 
@@ -1834,7 +1954,7 @@ async def merge(
         Optional callable that fully replaces
         :func:`gabriel.utils.openai_utils.get_all_embeddings`.
     **cfg_kwargs:
-        Additional overrides forwarded to :class:`gabriel.tasks.merge.MergeConfig`.
+        Additional overrides forwarded to :class:`gabriel.tasks.merge.MergeConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -1846,6 +1966,11 @@ async def merge(
 
     save_dir = os.path.expandvars(os.path.expanduser(save_dir))
     os.makedirs(save_dir, exist_ok=True)
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        MergeConfig,
+        dict(cfg_kwargs),
+        task_name="merge",
+    )
     cfg = MergeConfig(
         save_dir=save_dir,
         file_name=file_name,
@@ -1875,6 +2000,7 @@ async def merge(
         get_all_responses_fn=get_all_responses_fn,
         embedding_fn=embedding_fn,
         get_all_embeddings_fn=get_all_embeddings_fn,
+        **response_kwargs,
     )
 
 
@@ -1948,7 +2074,7 @@ async def filter(
         It must accept ``prompts`` and ``identifiers`` (and ideally ``model`` and
         ``json_mode``) and return a DataFrame containing a ``"Response"`` column.
     **cfg_kwargs:
-        Additional configuration passed to :class:`gabriel.tasks.filter.FilterConfig`.
+        Additional configuration passed to :class:`gabriel.tasks.filter.FilterConfig`. Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` / :func:`gabriel.utils.openai_utils.get_response` (for example ``image_detail``) are forwarded to the model call.
 
     Returns
     -------
@@ -1960,6 +2086,11 @@ async def filter(
     os.makedirs(save_dir, exist_ok=True)
     if df is None:
         return _load_cached_dataframe(None, task_name="Filter")
+    cfg_kwargs, response_kwargs = _split_cfg_and_response_kwargs(
+        FilterConfig,
+        dict(cfg_kwargs),
+        task_name="filter",
+    )
     cfg = FilterConfig(
         condition=condition,
         save_dir=save_dir,
@@ -1980,6 +2111,7 @@ async def filter(
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,
+        **response_kwargs,
     )
 
 

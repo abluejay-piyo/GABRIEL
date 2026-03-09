@@ -1472,6 +1472,117 @@ def test_api_wrappers(tmp_path):
     assert len(custom) == 1
 
 
+def test_api_rate_passes_response_kwargs_to_get_all_responses(tmp_path, monkeypatch):
+    captured: Dict[str, Any] = {}
+
+    async def fake_get_all_responses(**kwargs):
+        captured.update(kwargs)
+        identifiers = kwargs["identifiers"]
+        return pd.DataFrame(
+            {
+                "Identifier": identifiers,
+                "Response": ['{"clarity": 91}' for _ in identifiers],
+            }
+        )
+
+    monkeypatch.setattr("gabriel.tasks.rate.get_all_responses", fake_get_all_responses)
+
+    df = pd.DataFrame({"txt": ["hello"]})
+    rated = asyncio.run(
+        gabriel.rate(
+            df,
+            "txt",
+            attributes={"clarity": ""},
+            save_dir=str(tmp_path / "rate-pass-through"),
+            image_detail="high",
+            max_output_tokens=123,
+        )
+    )
+
+    assert rated.loc[0, "clarity"] == 91.0
+    assert captured["image_detail"] == "high"
+    assert captured["max_output_tokens"] == 123
+
+
+def test_api_classify_passes_response_kwargs_to_get_all_responses(tmp_path, monkeypatch):
+    captured: Dict[str, Any] = {}
+
+    async def fake_get_all_responses(**kwargs):
+        captured.update(kwargs)
+        identifiers = kwargs["identifiers"]
+        return pd.DataFrame(
+            {
+                "Identifier": identifiers,
+                "Response": ['{"yes": true}' for _ in identifiers],
+            }
+        )
+
+    monkeypatch.setattr("gabriel.tasks.classify.get_all_responses", fake_get_all_responses)
+
+    df = pd.DataFrame({"txt": ["hello"]})
+    classified = asyncio.run(
+        gabriel.classify(
+            df,
+            "txt",
+            labels={"yes": ""},
+            save_dir=str(tmp_path / "classify-pass-through"),
+            image_detail="low",
+            max_output_tokens=77,
+        )
+    )
+
+    assert bool(classified.loc[0, "yes"])
+    assert captured["image_detail"] == "low"
+    assert captured["max_output_tokens"] == 77
+
+
+def test_api_rate_default_call_unchanged_without_passthrough_kwargs(tmp_path, monkeypatch):
+    captured: Dict[str, Any] = {}
+
+    async def fake_get_all_responses(**kwargs):
+        captured.update(kwargs)
+        identifiers = kwargs["identifiers"]
+        return pd.DataFrame(
+            {
+                "Identifier": identifiers,
+                "Response": ['{"clarity": 88}' for _ in identifiers],
+            }
+        )
+
+    monkeypatch.setattr("gabriel.tasks.rate.get_all_responses", fake_get_all_responses)
+
+    df = pd.DataFrame({"txt": ["hello"]})
+    rated = asyncio.run(
+        gabriel.rate(
+            df,
+            "txt",
+            attributes={"clarity": ""},
+            save_dir=str(tmp_path / "rate-default-behavior"),
+            use_dummy=True,
+        )
+    )
+
+    assert rated.loc[0, "clarity"] == 88.0
+    assert captured["use_dummy"] is True
+    assert "image_detail" not in captured
+    assert "max_output_tokens" not in captured
+
+
+def test_api_rate_unknown_extra_kwarg_raises_clean_error(tmp_path):
+    df = pd.DataFrame({"txt": ["hello"]})
+
+    with pytest.raises(TypeError, match="gabriel.rate"):
+        asyncio.run(
+            gabriel.rate(
+                df,
+                "txt",
+                attributes={"clarity": ""},
+                save_dir=str(tmp_path / "rate-error"),
+                definitely_not_a_valid_kwarg=True,
+            )
+        )
+
+
 def test_extract_custom_response_functions(tmp_path):
     df = pd.DataFrame({"txt": ["hello"]})
     seen: Dict[str, Any] = {}
