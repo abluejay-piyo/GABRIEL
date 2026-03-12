@@ -5597,7 +5597,7 @@ async def get_all_responses(
                 f"API: {status.num_api_errors}, other: {status.num_other_errors})"
             )
 
-    async def adjust_timeout(*, force: bool = False) -> None:
+    async def adjust_timeout() -> None:
         nonlocal nonlocal_timeout, timeout_initialized, observed_latency_p90
         if not dynamic_timeout:
             return
@@ -6345,7 +6345,7 @@ async def get_all_responses(
                     status.num_timeout_errors += 1
                     _trigger_timeout_burst(time.time())
                     inflight.pop(ident, None)
-                    await adjust_timeout(force=True)
+                    await adjust_timeout()
                     if isinstance(e, APITimeoutError):
                         base_message = "OpenAI client timed out; consider reducing concurrency."
                     else:
