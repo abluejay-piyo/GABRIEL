@@ -398,6 +398,38 @@ def test_custom_base_url(monkeypatch):
     assert str(client2.base_url) == "https://example.org/v1/"
 
 
+def test_get_client_only_overrides_transport_above_sdk_default_connection_limit(
+    monkeypatch,
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "x")
+    openai_utils._clients_async.clear()
+    captured: Dict[str, Any] = {}
+
+    class DummyHttpClient:
+        def __init__(self, **kwargs):
+            captured["http_client_kwargs"] = kwargs
+
+    class DummyClient:
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+            self.base_url = "https://api.openai.com/v1/"
+
+    monkeypatch.setattr(openai, "DefaultAsyncHttpxClient", DummyHttpClient)
+    monkeypatch.setattr(openai, "AsyncOpenAI", DummyClient)
+
+    openai_utils._get_client(desired_parallelism=650)
+    assert "http_client" not in captured["client_kwargs"]
+
+    openai_utils._clients_async.clear()
+    captured.clear()
+
+    openai_utils._get_client(desired_parallelism=1500)
+    assert isinstance(captured["client_kwargs"]["http_client"], DummyHttpClient)
+    limits = captured["http_client_kwargs"]["limits"]
+    assert limits.max_connections == 2250
+    openai_utils._clients_async.clear()
+
+
 def test_get_embedding_dummy():
     emb, _ = asyncio.run(openai_utils.get_embedding("hi", use_dummy=True))
     assert isinstance(emb, list) and emb and isinstance(emb[0], float)

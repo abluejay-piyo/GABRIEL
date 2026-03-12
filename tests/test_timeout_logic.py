@@ -10,7 +10,7 @@ from gabriel.utils.openai_utils import (
     _collect_successful_time_taken_samples,
     _collect_successful_output_token_stats,
     _compute_dynamic_timeout_from_samples,
-    _dynamic_timeout_refresh_success_delta,
+    _dynamic_timeout_success_window,
     _estimate_output_tps,
     _http_max_connections_for_parallelism,
     _resolve_effective_timeout,
@@ -87,11 +87,11 @@ def test_compute_dynamic_timeout_from_samples_returns_none_without_valid_data() 
     assert timeout_stats is None
 
 
-def test_dynamic_timeout_refresh_success_delta_is_bounded() -> None:
-    assert _dynamic_timeout_refresh_success_delta(1) == 25
-    assert _dynamic_timeout_refresh_success_delta(100) == 25
-    assert _dynamic_timeout_refresh_success_delta(600) == 150
-    assert _dynamic_timeout_refresh_success_delta(1200) == 250
+def test_dynamic_timeout_success_window_is_bounded() -> None:
+    assert _dynamic_timeout_success_window(1) == 4
+    assert _dynamic_timeout_success_window(100) == 400
+    assert _dynamic_timeout_success_window(600) == 2400
+    assert _dynamic_timeout_success_window(1200) == 4096
 
 
 def test_estimate_output_tps_requires_positive_tokens_and_duration() -> None:
@@ -120,4 +120,5 @@ def test_collect_successful_output_token_stats_sums_reasoning_tokens() -> None:
 
 
 def test_http_max_connections_scale_with_parallelism() -> None:
+    assert _http_max_connections_for_parallelism(650) == 1000
     assert _http_max_connections_for_parallelism(1500) == 2250

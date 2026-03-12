@@ -208,19 +208,15 @@ def test_ramp_up_does_not_halt_after_window(tmp_path, capsys):
     assert "Halting ramp-up" not in output
 
 
-def test_dynamic_timeout_refresh_is_not_recomputed_every_success(tmp_path, monkeypatch):
-    calls = {"count": 0}
+def test_dynamic_timeout_uses_bounded_recent_window(tmp_path, monkeypatch):
+    captured_lengths = []
     original = openai_utils._compute_dynamic_timeout_from_samples
 
-    def wrapped(*args, **kwargs):
-        calls["count"] += 1
-        return original(*args, **kwargs)
+    def wrapped(durations, *args, **kwargs):
+        captured_lengths.append(len(list(durations)))
+        return original(durations, *args, **kwargs)
 
-    monkeypatch.setattr(
-        openai_utils,
-        "_compute_dynamic_timeout_from_samples",
-        wrapped,
-    )
+    monkeypatch.setattr(openai_utils, "_compute_dynamic_timeout_from_samples", wrapped)
 
     async def responder(prompt: str, **_: object):
         await asyncio.sleep(0)
@@ -228,8 +224,8 @@ def test_dynamic_timeout_refresh_is_not_recomputed_every_success(tmp_path, monke
 
     asyncio.run(
         openai_utils.get_all_responses(
-            prompts=[f"p{i}" for i in range(40)],
-            identifiers=[f"p{i}" for i in range(40)],
+            prompts=[f"p{i}" for i in range(80)],
+            identifiers=[f"p{i}" for i in range(80)],
             response_fn=responder,
             use_dummy=False,
             save_path=str(tmp_path / "responses.csv"),
@@ -245,7 +241,8 @@ def test_dynamic_timeout_refresh_is_not_recomputed_every_success(tmp_path, monke
         )
     )
 
-    assert calls["count"] == 2
+    assert captured_lengths
+    assert max(captured_lengths) == openai_utils._dynamic_timeout_success_window(3)
 
 
 def test_periodic_status_update_reports_p90_and_tps_in_requested_order(

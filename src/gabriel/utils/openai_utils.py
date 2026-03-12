@@ -83,8 +83,11 @@ _DEPENDENCIES_VERIFIED = False
 _ESTIMATION_SAMPLE_SIZE = 5000
 
 _TIMEOUT_BURST_RATIO = 1.25
-_TIMEOUT_REFRESH_MIN_SUCCESS_DELTA = 25
-_TIMEOUT_REFRESH_MAX_SUCCESS_DELTA = 250
+_TIMEOUT_SUCCESS_WINDOW_MULTIPLIER = 4
+_TIMEOUT_SUCCESS_WINDOW_MAX = 4096
+_DEFAULT_HTTP_MAX_CONNECTIONS = 1000
+_DEFAULT_HTTP_MAX_KEEPALIVE_CONNECTIONS = 100
+_DEFAULT_HTTP_KEEPALIVE_EXPIRY = 5.0
 
 DEFAULT_SYSTEM_INSTRUCTION = (
     "Please provide a helpful response to this inquiry for purposes of academic research."
@@ -148,7 +151,17 @@ def _http_max_connections_for_parallelism(parallelism: int) -> int:
     """Return the HTTP connection cap sized for the requested concurrency."""
 
     desired = max(1, int(math.ceil(parallelism)))
-    return max(1000, int(math.ceil(desired * 1.5)))
+    return max(_DEFAULT_HTTP_MAX_CONNECTIONS, int(math.ceil(desired * 1.5)))
+
+
+def _dynamic_timeout_success_window(samples_for_timeout: int) -> int:
+    """Return the bounded rolling window size for timeout planning."""
+
+    base = max(1, int(samples_for_timeout))
+    return min(
+        _TIMEOUT_SUCCESS_WINDOW_MAX,
+        max(base, int(math.ceil(base * _TIMEOUT_SUCCESS_WINDOW_MULTIPLIER))),
+    )
 
 
 def _client_max_connections(client: Optional[openai.AsyncOpenAI]) -> Optional[int]:
@@ -182,32 +195,32 @@ def _get_client(
         desired_max_connections = _http_max_connections_for_parallelism(
             desired_parallelism
         )
-        current_max = _client_max_connections(client)
-        if current_max is None or current_max < desired_max_connections:
-            needs_rebuild = True
+        if desired_max_connections > _DEFAULT_HTTP_MAX_CONNECTIONS:
+            current_max = _client_max_connections(client)
+            if current_max is None or current_max < desired_max_connections:
+                needs_rebuild = True
     if needs_rebuild:
         kwargs: Dict[str, Any] = {}
         if url:
             kwargs["base_url"] = url
         if httpx is not None:
             try:
-                timeout = httpx.Timeout(connect=10.0, read=None, write=None, pool=None)
-                kwargs.setdefault("timeout", timeout)
-                if desired_max_connections is not None:
-                    kwargs["http_client"] = httpx.AsyncClient(
-                        timeout=timeout,
+                if (
+                    desired_max_connections is not None
+                    and desired_max_connections > _DEFAULT_HTTP_MAX_CONNECTIONS
+                ):
+                    kwargs["http_client"] = openai.DefaultAsyncHttpxClient(
                         limits=httpx.Limits(
                             max_connections=desired_max_connections,
-                            keepalive_expiry=30.0,
+                            max_keepalive_connections=min(
+                                _DEFAULT_HTTP_MAX_KEEPALIVE_CONNECTIONS,
+                                desired_max_connections,
+                            ),
+                            keepalive_expiry=_DEFAULT_HTTP_KEEPALIVE_EXPIRY,
                         ),
                     )
-                else:
-                    kwargs.setdefault(
-                        "timeout",
-                        httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
-                    )
             except Exception:
-                # Fall back to the SDK default if constructing the timeout fails
+                # Fall back to the SDK default if constructing the client fails.
                 pass
         client = openai.AsyncOpenAI(**kwargs)
         _clients_async[url] = client
@@ -3253,16 +3266,6 @@ def _compute_dynamic_timeout_from_samples(
     return timeout, p90
 
 
-def _dynamic_timeout_refresh_success_delta(samples_for_timeout: int) -> int:
-    """Return how many new successes to accumulate before recomputing p90."""
-
-    base = max(1, int(samples_for_timeout))
-    return max(
-        _TIMEOUT_REFRESH_MIN_SUCCESS_DELTA,
-        min(_TIMEOUT_REFRESH_MAX_SUCCESS_DELTA, int(math.ceil(base / 4))),
-    )
-
-
 def _estimate_output_tps(
     total_output_tokens: float,
     total_duration_seconds: float,
@@ -4933,13 +4936,6 @@ async def get_all_responses(
     if not use_batch and manage_rate_limits:
         req_lim = AsyncLimiter(allowed_req_pm, 60)
         tok_lim = AsyncLimiter(allowed_tok_pm, 60)
-    success_times: List[float] = list(checkpoint_success_durations)
-    timeout_initialized = False
-    observed_latency_p90 = float("inf")
-    last_timeout_refresh_success_count = 0
-    inflight: Dict[str, Tuple[float, asyncio.Task, float]] = {}
-    error_logs: Dict[str, List[str]] = defaultdict(list)
-    call_count = 0
     samples_for_timeout = max(
         1,
         int(
@@ -4951,19 +4947,25 @@ async def get_all_responses(
             )
         ),
     )
-    timeout_refresh_success_delta = _dynamic_timeout_refresh_success_delta(
-        samples_for_timeout
+    timeout_success_window = _dynamic_timeout_success_window(samples_for_timeout)
+    success_times: Deque[float] = deque(
+        checkpoint_success_durations[-timeout_success_window:],
+        maxlen=timeout_success_window,
     )
+    timeout_initialized = False
+    observed_latency_p90 = float("inf")
+    inflight: Dict[str, Tuple[float, asyncio.Task, float]] = {}
+    error_logs: Dict[str, List[str]] = defaultdict(list)
+    call_count = 0
     if dynamic_timeout and len(success_times) >= samples_for_timeout:
         timeout_stats = _compute_dynamic_timeout_from_samples(
-            success_times,
+            list(success_times),
             timeout_factor=timeout_factor,
             max_timeout=max_timeout_val,
         )
         if timeout_stats is not None:
             nonlocal_timeout, observed_latency_p90 = timeout_stats
             timeout_initialized = True
-            last_timeout_refresh_success_count = len(success_times)
             timeout_display = (
                 "inf" if math.isinf(nonlocal_timeout) else f"{nonlocal_timeout:.1f}s"
             )
@@ -5597,22 +5599,13 @@ async def get_all_responses(
 
     async def adjust_timeout(*, force: bool = False) -> None:
         nonlocal nonlocal_timeout, timeout_initialized, observed_latency_p90
-        nonlocal last_timeout_refresh_success_count
         if not dynamic_timeout:
             return
-        success_count = len(success_times)
-        if success_count < samples_for_timeout:
-            return
-        if (
-            not force
-            and timeout_initialized
-            and (success_count - last_timeout_refresh_success_count)
-            < timeout_refresh_success_delta
-        ):
+        if len(success_times) < samples_for_timeout:
             return
         try:
             timeout_stats = _compute_dynamic_timeout_from_samples(
-                success_times,
+                list(success_times),
                 timeout_factor=timeout_factor,
                 max_timeout=max_timeout_val,
             )
@@ -5620,7 +5613,6 @@ async def get_all_responses(
                 return
             new_timeout, p90 = timeout_stats
             observed_latency_p90 = p90
-            last_timeout_refresh_success_count = success_count
             if math.isinf(nonlocal_timeout):
                 nonlocal_timeout = new_timeout
                 if not timeout_initialized:
@@ -5629,9 +5621,7 @@ async def get_all_responses(
                         if math.isinf(nonlocal_timeout)
                         else f"{nonlocal_timeout:.1f}s"
                     )
-                    p90_display = (
-                        "inf" if math.isinf(p90) else f"{p90:.1f}s"
-                    )
+                    p90_display = "inf" if math.isinf(p90) else f"{p90:.1f}s"
                     msg = (
                         "[dynamic timeout] Initialized timeout to "
                         f"{timeout_display} (p90={p90_display}, factor={timeout_factor:.2f})."
