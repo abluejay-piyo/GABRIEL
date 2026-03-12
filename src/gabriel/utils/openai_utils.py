@@ -83,6 +83,8 @@ _DEPENDENCIES_VERIFIED = False
 _ESTIMATION_SAMPLE_SIZE = 5000
 
 _TIMEOUT_BURST_RATIO = 1.25
+_TIMEOUT_REFRESH_MIN_SUCCESS_DELTA = 25
+_TIMEOUT_REFRESH_MAX_SUCCESS_DELTA = 250
 
 DEFAULT_SYSTEM_INSTRUCTION = (
     "Please provide a helpful response to this inquiry for purposes of academic research."
@@ -142,8 +144,28 @@ def _display_example_prompt(example_prompt: str, *, verbose: bool = True) -> Non
     print(textwrap.indent(example_prompt.strip("\n"), "  "))
 
 
+def _http_max_connections_for_parallelism(parallelism: int) -> int:
+    """Return the HTTP connection cap sized for the requested concurrency."""
+
+    desired = max(1, int(math.ceil(parallelism)))
+    return max(1000, int(math.ceil(desired * 1.5)))
+
+
+def _client_max_connections(client: Optional[openai.AsyncOpenAI]) -> Optional[int]:
+    """Return the configured HTTP connection cap for a cached client."""
+
+    if client is None:
+        return None
+    http_client = getattr(client, "_client", None)
+    transport = getattr(http_client, "_transport", None)
+    pool = getattr(transport, "_pool", None)
+    return getattr(pool, "_max_connections", None)
+
+
 def _get_client(
     base_url: Optional[str] = None,
+    *,
+    desired_parallelism: Optional[int] = None,
 ) -> openai.AsyncOpenAI:
     """Return a cached ``AsyncOpenAI`` client for ``base_url``.
 
@@ -154,16 +176,36 @@ def _get_client(
 
     url = base_url or os.getenv("OPENAI_BASE_URL")
     client = _clients_async.get(url)
-    if client is None:
+    desired_max_connections: Optional[int] = None
+    needs_rebuild = client is None
+    if desired_parallelism is not None and httpx is not None:
+        desired_max_connections = _http_max_connections_for_parallelism(
+            desired_parallelism
+        )
+        current_max = _client_max_connections(client)
+        if current_max is None or current_max < desired_max_connections:
+            needs_rebuild = True
+    if needs_rebuild:
         kwargs: Dict[str, Any] = {}
         if url:
             kwargs["base_url"] = url
         if httpx is not None:
             try:
-                kwargs.setdefault(
-                    "timeout",
-                    httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
-                )
+                timeout = httpx.Timeout(connect=10.0, read=None, write=None, pool=None)
+                kwargs.setdefault("timeout", timeout)
+                if desired_max_connections is not None:
+                    kwargs["http_client"] = httpx.AsyncClient(
+                        timeout=timeout,
+                        limits=httpx.Limits(
+                            max_connections=desired_max_connections,
+                            keepalive_expiry=30.0,
+                        ),
+                    )
+                else:
+                    kwargs.setdefault(
+                        "timeout",
+                        httpx.Timeout(connect=10.0, read=None, write=None, pool=None),
+                    )
             except Exception:
                 # Fall back to the SDK default if constructing the timeout fails
                 pass
@@ -1713,6 +1755,7 @@ async def get_response(
     audio: Optional[List[Dict[str, str]]] = None,
     pdfs: Optional[List[Dict[str, str]]] = None,
     return_raw: bool = False,
+    request_phase_callback: Optional[Callable[[str, int], None]] = None,
     logging_level: Optional[Union[str, int]] = None,
     background_mode: Optional[bool] = None,
     background_poll_interval: float = 10.0,
@@ -1784,6 +1827,9 @@ async def get_response(
     return_raw:
         If ``True`` the raw SDK response objects are returned alongside the
         extracted text and timing information.
+    request_phase_callback:
+        Optional internal callback used for lightweight request-phase telemetry.
+        The callable receives ``(phase_name, delta)`` updates.
     logging_level:
         Optional override for the module's log level.
     background_mode:
@@ -2002,6 +2048,8 @@ async def get_response(
             )
             for _ in range(max(n, 1))
         ]
+        if request_phase_callback is not None:
+            request_phase_callback("awaiting_response", len(tasks))
         try:
             raw = await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -2024,6 +2072,9 @@ async def get_response(
                 "[get_response] API call resulted in exception: %r", e, exc_info=True
             )
             raise
+        finally:
+            if request_phase_callback is not None:
+                request_phase_callback("awaiting_response", -len(tasks))
         texts = []
         for r in raw:
             msg = r.choices[0].message
@@ -2118,6 +2169,8 @@ async def get_response(
             )
             for _ in range(total_needed)
         ]
+        if request_phase_callback is not None:
+            request_phase_callback("awaiting_response", len(new_tasks))
         try:
             raw_new = await asyncio.gather(*new_tasks)
         except asyncio.CancelledError:
@@ -2140,6 +2193,9 @@ async def get_response(
                 "[get_response] API call resulted in exception: %r", e, exc_info=True
             )
             raise
+        finally:
+            if request_phase_callback is not None:
+                request_phase_callback("awaiting_response", -len(new_tasks))
         def _should_poll_response(resp: Any) -> bool:
             status = _safe_get(resp, "status")
             if status in failure_statuses or status == "requires_action":
@@ -3197,6 +3253,60 @@ def _compute_dynamic_timeout_from_samples(
     return timeout, p90
 
 
+def _dynamic_timeout_refresh_success_delta(samples_for_timeout: int) -> int:
+    """Return how many new successes to accumulate before recomputing p90."""
+
+    base = max(1, int(samples_for_timeout))
+    return max(
+        _TIMEOUT_REFRESH_MIN_SUCCESS_DELTA,
+        min(_TIMEOUT_REFRESH_MAX_SUCCESS_DELTA, int(math.ceil(base / 4))),
+    )
+
+
+def _estimate_output_tps(
+    total_output_tokens: float,
+    total_duration_seconds: float,
+) -> Optional[float]:
+    """Estimate output tokens per second from accumulated successful calls."""
+
+    if total_output_tokens <= 0 or total_duration_seconds <= 0:
+        return None
+    return float(total_output_tokens) / float(total_duration_seconds)
+
+
+def _collect_successful_output_token_stats(
+    df: pd.DataFrame, *, success_mask: Optional[pd.Series] = None
+) -> Tuple[float, float]:
+    """Return ``(output_tokens_including_reasoning, total_duration_seconds)``."""
+
+    if df.empty or "Time Taken" not in df.columns:
+        return 0.0, 0.0
+    times = pd.to_numeric(df["Time Taken"], errors="coerce")
+    output_series = (
+        df["Output Tokens"]
+        if "Output Tokens" in df.columns
+        else pd.Series(0, index=df.index, dtype="float64")
+    )
+    reasoning_series = (
+        df["Reasoning Tokens"]
+        if "Reasoning Tokens" in df.columns
+        else pd.Series(0, index=df.index, dtype="float64")
+    )
+    output_tokens = pd.to_numeric(output_series, errors="coerce").fillna(0)
+    reasoning_tokens = pd.to_numeric(reasoning_series, errors="coerce").fillna(0)
+    if success_mask is not None:
+        with contextlib.suppress(Exception):
+            times = times[success_mask]
+            output_tokens = output_tokens[success_mask]
+            reasoning_tokens = reasoning_tokens[success_mask]
+    valid = np.isfinite(times) & (times > 0)
+    if not np.any(valid):
+        return 0.0, 0.0
+    total_duration = float(times[valid].sum())
+    total_output = float((output_tokens[valid] + reasoning_tokens[valid]).sum())
+    return total_output, total_duration
+
+
 def _normalize_response_result(result: Any) -> Tuple[List[Any], Optional[float], List[Any]]:
     """Normalize outputs from ``response_fn`` into ``(responses, duration, raw)``."""
 
@@ -3910,6 +4020,8 @@ async def get_all_responses(
                     "or decrease further if running into API errors."
                 )
                 logger.info(web_search_parallel_note)
+    if not use_batch and not use_dummy and not using_custom_response_fn:
+        _get_client(base_url, desired_parallelism=user_requested_n_parallels)
     web_search_warning_displayed = False
     web_search_note_displayed = False
     # Decide default cutoff once per job using cached rate headers
@@ -3949,6 +4061,8 @@ async def get_all_responses(
     checkpoint_identifiers: Set[str] = set()
     csv_header_written = os.path.exists(save_path) and not reset_files and os.path.getsize(save_path) > 0
     checkpoint_success_durations: List[float] = []
+    checkpoint_output_tokens_total = 0.0
+    checkpoint_success_duration_total = 0.0
     if loaded_from_checkpoint:
         if message_verbose:
             print(f"Reading from existing files at {save_path}...")
@@ -3998,9 +4112,20 @@ async def get_all_responses(
                 df,
                 success_mask=success_mask,
             )
+            (
+                checkpoint_output_tokens_total,
+                checkpoint_success_duration_total,
+            ) = _collect_successful_output_token_stats(
+                df,
+                success_mask=success_mask,
+            )
         else:
             done = set(df["Identifier"].astype(str))
             checkpoint_success_durations = _collect_successful_time_taken_samples(df)
+            (
+                checkpoint_output_tokens_total,
+                checkpoint_success_duration_total,
+            ) = _collect_successful_output_token_stats(df)
         if message_verbose:
             print(f"Loaded {len(df):,} rows; {len(done):,} already marked complete.")
     else:
@@ -4811,6 +4936,7 @@ async def get_all_responses(
     success_times: List[float] = list(checkpoint_success_durations)
     timeout_initialized = False
     observed_latency_p90 = float("inf")
+    last_timeout_refresh_success_count = 0
     inflight: Dict[str, Tuple[float, asyncio.Task, float]] = {}
     error_logs: Dict[str, List[str]] = defaultdict(list)
     call_count = 0
@@ -4825,6 +4951,9 @@ async def get_all_responses(
             )
         ),
     )
+    timeout_refresh_success_delta = _dynamic_timeout_refresh_success_delta(
+        samples_for_timeout
+    )
     if dynamic_timeout and len(success_times) >= samples_for_timeout:
         timeout_stats = _compute_dynamic_timeout_from_samples(
             success_times,
@@ -4834,6 +4963,7 @@ async def get_all_responses(
         if timeout_stats is not None:
             nonlocal_timeout, observed_latency_p90 = timeout_stats
             timeout_initialized = True
+            last_timeout_refresh_success_count = len(success_times)
             timeout_display = (
                 "inf" if math.isinf(nonlocal_timeout) else f"{nonlocal_timeout:.1f}s"
             )
@@ -4866,6 +4996,7 @@ async def get_all_responses(
     rate_limit_errors_since_adjust = 0
     successes_since_adjust = 0
     active_workers = 0
+    awaiting_response_count = 0
     rate_limit_window = max(1.0, float(rate_limit_window))
     connection_error_window = max(1.0, float(connection_error_window))
     rate_limit_error_times: Deque[float] = deque()
@@ -4890,6 +5021,8 @@ async def get_all_responses(
     observed_output_tokens_total = 0.0
     observed_reasoning_tokens_total = 0.0
     observed_usage_count = 0
+    observed_completed_output_tokens_total = checkpoint_output_tokens_total
+    observed_completed_duration_total = checkpoint_success_duration_total
     estimate_update_target = max(1, min(_effective_parallel_ceiling(), len(todo_pairs)))
     estimate_update_done = False
     estimate_refresh_cooldown = 60.0
@@ -5250,30 +5383,31 @@ async def get_all_responses(
             current_tokens_per_call,
             context="reporting parallelization status",
         )
-        timeout_text = ""
-        connection_text = ""
         total_completed = processed
         denom = max(total_completed, 1)
         effective_cap = _current_parallel_cap()
-        if status.num_timeout_errors or total_completed:
-            timeout_text = f"timeouts={status.num_timeout_errors}/{denom}"
-            if status_report_interval is not None and timeout_errors_since_last_status:
-                timeout_text += f" (+{timeout_errors_since_last_status} since last)"
-            burst_alert_threshold = _effective_timeout_burst_threshold()
-            if timeout_errors_since_last_status >= burst_alert_threshold:
-                burst_msg = (
-                    f"[timeouts] {timeout_errors_since_last_status} timeouts since last update; "
-                    "consider reducing concurrency or checking network stability if this persists."
-                )
-                logger.warning(burst_msg)
-                if message_verbose:
-                    print(burst_msg)
-        cost_text = ""
+        timeout_text = f"timeouts={status.num_timeout_errors}/{denom}"
+        if status_report_interval is not None and timeout_errors_since_last_status:
+            timeout_text += f" (+{timeout_errors_since_last_status} since last)"
+        burst_alert_threshold = _effective_timeout_burst_threshold()
+        if timeout_errors_since_last_status >= burst_alert_threshold:
+            burst_msg = (
+                f"[timeouts] {timeout_errors_since_last_status} timeouts since last update; "
+                "consider reducing concurrency or checking network stability if this persists."
+            )
+            logger.warning(burst_msg)
+            if message_verbose:
+                print(burst_msg)
+        cost_text = "cost_so_far=unknown"
         cost_snapshot = _cost_progress_snapshot()
         if cost_snapshot is not None:
             total_cost, sampled = cost_snapshot
             cost_text = f"cost_so_far={'~' if sampled else ''}${total_cost:.2f}"
-        prefix = f"[{label}] " if label else ""
+        p90_text = (
+            f"p90={observed_latency_p90:.2f} sec"
+            if math.isfinite(observed_latency_p90)
+            else "p90=unknown"
+        )
         connection_text = f"connection_errors={status.num_connection_errors}/{denom}"
         if status_report_interval is not None and connection_errors_since_last_status:
             connection_text += f" (+{connection_errors_since_last_status} since last)"
@@ -5285,26 +5419,33 @@ async def get_all_responses(
         json_parse_text = f"json_parse_errors={status.num_json_parse_errors}/{denom}"
         if status_report_interval is not None and json_parse_errors_since_last_status:
             json_parse_text += f" (+{json_parse_errors_since_last_status} since last)"
+        tps_value = _estimate_output_tps(
+            observed_completed_output_tokens_total,
+            observed_completed_duration_total,
+        )
+        tps_text = f"tps={tps_value:.2f}" if tps_value is not None else "tps=unknown"
+        throughput_text = (
+            f"throughput<={planned_ppm} prompts/min"
+            if planned_ppm is not None
+            else "throughput=unknown"
+        )
         status_bits: List[str] = [
+            cost_text,
+            p90_text,
+            timeout_text,
+            rate_limit_text,
+            connection_text,
+            json_parse_text,
+            tps_text,
+            throughput_text,
             f"cap={effective_cap}",
             f"active={active_workers}",
             f"inflight={len(inflight)}",
+            f"awaiting_response={awaiting_response_count}",
             f"queue={queue.qsize()}",
             f"processed={processed}/{status.num_tasks_started}",
-            rate_limit_text,
-            json_parse_text,
         ]
-        if ramp_up_enabled and not ramp_up_halted and effective_cap < concurrency_cap:
-            status_bits.insert(1, f"ramp_target={concurrency_cap}")
-        if cost_text:
-            status_bits.insert(0, cost_text)
-        if planned_ppm is not None:
-            ppm_piece = f"throughput<={planned_ppm} prompts/min"
-            status_bits.append(ppm_piece)
-        if timeout_text:
-            status_bits.append(timeout_text)
-        if connection_text:
-            status_bits.append(connection_text)
+        prefix = f"[{label}] " if label else ""
         msg = f"{prefix}{timestamp} | {reason_clean}: " + ", ".join(status_bits)
         if message_verbose:
             print(msg)
@@ -5454,11 +5595,20 @@ async def get_all_responses(
                 f"API: {status.num_api_errors}, other: {status.num_other_errors})"
             )
 
-    async def adjust_timeout() -> None:
+    async def adjust_timeout(*, force: bool = False) -> None:
         nonlocal nonlocal_timeout, timeout_initialized, observed_latency_p90
+        nonlocal last_timeout_refresh_success_count
         if not dynamic_timeout:
             return
-        if len(success_times) < samples_for_timeout:
+        success_count = len(success_times)
+        if success_count < samples_for_timeout:
+            return
+        if (
+            not force
+            and timeout_initialized
+            and (success_count - last_timeout_refresh_success_count)
+            < timeout_refresh_success_delta
+        ):
             return
         try:
             timeout_stats = _compute_dynamic_timeout_from_samples(
@@ -5470,6 +5620,7 @@ async def get_all_responses(
                 return
             new_timeout, p90 = timeout_stats
             observed_latency_p90 = p90
+            last_timeout_refresh_success_count = success_count
             if math.isinf(nonlocal_timeout):
                 nonlocal_timeout = new_timeout
                 if not timeout_initialized:
@@ -5607,6 +5758,8 @@ async def get_all_responses(
         nonlocal throughput_ceiling_ppm, observed_input_tokens_total, observed_output_tokens_total
         nonlocal observed_reasoning_tokens_total, observed_usage_count, connection_errors_since_adjust
         nonlocal connection_errors_since_last_status, json_parse_errors_since_last_status
+        nonlocal observed_completed_output_tokens_total, observed_completed_duration_total
+        nonlocal awaiting_response_count
         while True:
             if stop_event.is_set():
                 break
@@ -5786,6 +5939,16 @@ async def get_all_responses(
                         "use_dummy": use_dummy,
                     }
                 )
+                if not using_custom_response_fn:
+                    def _request_phase_callback(phase_name: str, delta: int) -> None:
+                        nonlocal awaiting_response_count
+                        if phase_name != "awaiting_response":
+                            return
+                        awaiting_response_count = max(
+                            0, awaiting_response_count + int(delta)
+                        )
+
+                    call_kwargs["request_phase_callback"] = _request_phase_callback
                 if using_custom_response_fn and provided_api_key is not None:
                     call_kwargs.setdefault("api_key", provided_api_key)
                 if response_accepts_return_raw:
@@ -6107,6 +6270,10 @@ async def get_all_responses(
                 is_success = True if success_override is None else bool(success_override)
                 if is_success and duration is not None:
                     success_times.append(duration)
+                    observed_completed_duration_total += float(duration)
+                    observed_completed_output_tokens_total += float(
+                        total_output + total_reasoning
+                    )
                     await adjust_timeout()
                 row["Successful"] = is_success
                 results.append(row)
@@ -6188,7 +6355,7 @@ async def get_all_responses(
                     status.num_timeout_errors += 1
                     _trigger_timeout_burst(time.time())
                     inflight.pop(ident, None)
-                    await adjust_timeout()
+                    await adjust_timeout(force=True)
                     if isinstance(e, APITimeoutError):
                         base_message = "OpenAI client timed out; consider reducing concurrency."
                     else:

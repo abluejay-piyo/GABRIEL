@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 
 from gabriel.utils import openai_utils
@@ -205,3 +206,115 @@ def test_ramp_up_does_not_halt_after_window(tmp_path, capsys):
 
     output = capsys.readouterr().out
     assert "Halting ramp-up" not in output
+
+
+def test_dynamic_timeout_refresh_is_not_recomputed_every_success(tmp_path, monkeypatch):
+    calls = {"count": 0}
+    original = openai_utils._compute_dynamic_timeout_from_samples
+
+    def wrapped(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        openai_utils,
+        "_compute_dynamic_timeout_from_samples",
+        wrapped,
+    )
+
+    async def responder(prompt: str, **_: object):
+        await asyncio.sleep(0)
+        return [f"ok-{prompt}"], 0.05, []
+
+    asyncio.run(
+        openai_utils.get_all_responses(
+            prompts=[f"p{i}" for i in range(40)],
+            identifiers=[f"p{i}" for i in range(40)],
+            response_fn=responder,
+            use_dummy=False,
+            save_path=str(tmp_path / "responses.csv"),
+            reset_files=True,
+            dynamic_timeout=True,
+            max_timeout=1.0,
+            timeout_factor=2.0,
+            max_retries=1,
+            n_parallels=4,
+            ramp_up_seconds=0,
+            status_report_interval=None,
+            logging_level="error",
+        )
+    )
+
+    assert calls["count"] == 2
+
+
+def test_periodic_status_update_reports_p90_and_tps_in_requested_order(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(openai_utils, "_ensure_runtime_dependencies", lambda **_: None)
+    monkeypatch.setattr(
+        openai_utils,
+        "_get_rate_limit_headers",
+        lambda *args, **kwargs: {
+            "limit_requests": "30000",
+            "remaining_requests": "30000",
+            "limit_tokens": "180000000",
+            "remaining_tokens": "180000000",
+        },
+    )
+
+    async def fake_get_response(prompt: str, **_: object):
+        await asyncio.sleep(0.15)
+        raw = [
+            {
+                "id": f"resp-{prompt}",
+                "usage": {
+                    "input_tokens": 40,
+                    "output_tokens": 30,
+                    "output_tokens_details": {"reasoning_tokens": 20},
+                },
+                "output": [],
+            }
+        ]
+        return [f"ok-{prompt}"], 0.20, raw
+
+    monkeypatch.setattr(openai_utils, "get_response", fake_get_response)
+
+    asyncio.run(
+        openai_utils.get_all_responses(
+            prompts=[f"p{i}" for i in range(18)],
+            identifiers=[f"p{i}" for i in range(18)],
+            save_path=str(tmp_path / "responses.csv"),
+            reset_files=True,
+            dynamic_timeout=True,
+            max_timeout=5.0,
+            timeout_factor=2.0,
+            max_retries=1,
+            n_parallels=3,
+            ramp_up_seconds=0,
+            status_report_interval=0.2,
+            print_example_prompt=False,
+            logging_level="error",
+        )
+    )
+
+    output = capsys.readouterr().out
+    periodic_lines = [
+        line for line in output.splitlines() if "Periodic status update:" in line
+    ]
+    assert periodic_lines
+    line = periodic_lines[-1]
+    pattern = re.compile(
+        r"Periodic status update: "
+        r"cost_so_far=.*?, "
+        r"p90=\d+\.\d{2} sec, "
+        r"timeouts=\d+/\d+(?: \(\+\d+ since last\))?, "
+        r"rate_limit_errors=\d+/\d+(?: \(\+\d+ since last\))?, "
+        r"connection_errors=\d+/\d+(?: \(\+\d+ since last\))?, "
+        r"json_parse_errors=\d+/\d+(?: \(\+\d+ since last\))?, "
+        r"tps=\d+\.\d{2}, "
+        r"throughput<=\d+ prompts/min, "
+        r"cap=\d+, active=\d+, inflight=\d+, awaiting_response=\d+, queue=\d+, processed=\d+/\d+"
+    )
+    assert pattern.search(line), line
