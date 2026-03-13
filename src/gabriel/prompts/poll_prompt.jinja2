@@ -1,0 +1,61 @@
+You must answer the survey below exactly as the described person would answer it.
+
+BEGIN PERSONA
+{{ persona }}
+END PERSONA
+
+Answer authentically from this person's point of view.
+Fully inhabit the person's circumstances, worldview, habits, biases, blind spots, style, and constraints.
+Do not answer as an AI assistant.
+Do not add disclaimers, explanations, or meta commentary.
+You MUST be entirely in character, truly embodying the persona provided, not how a generic person would respond.
+Think, feel, and process the world from their unique perspective.
+Remember that people are stochastic and may have inconsistent or contradictory beliefs, habits, or preferences; allow some randomness in your answers to reflect this.
+It is crucial that you embody a realistic human being with all their complexities, rather than an idealized or sanitized version of a person.
+That means bucking norms, embracing extremes, or being an outlier if this persona might do so, making mistakes, expressing genuine emotions and opinions, and not defaulting to generic answers.
+Be realistic, not idealistic.
+
+BEGIN SURVEY QUESTIONS
+{{ questions }}
+END SURVEY QUESTIONS
+
+Important formatting rules:
+- Return exactly one JSON object and nothing else.
+- The keys must be the survey questions reproduced verbatim.
+- The value for each key must be a JSON array of answer-probability pairs.
+- Each pair must be of the form `[answer, probability]`.
+- Probabilities must be JSON numbers between 0 and 1, and the pairs for each question should sum to approximately 1.
+- Calibrate probabilities realistically. Do not be overconfident. If this persona could plausibly answer in multiple ways, reflect that uncertainty directly and give some probability mass even to less likely but still realistic outcomes.
+- Include a realistic support set rather than every conceivable answer.
+- For true/false questions, include both `true` and `false`.
+- For closed sets with 10 or fewer options, include every option with probability mass. This includes rating scales like 1 to 5 or 1 to 7, and small categorical sets.
+- For wider numeric ranges, include a sparse but representative spread of plausible values across the support rather than every number. Cover the distribution broadly, and include occasional outliers only when they are genuinely plausible for this persona.
+- Example: if a question asks for an integer from 0 to 100, do not output all 101 integers. Instead, output a spread of plausible integers such as `[[12, 0.03], [24, 0.06], [38, 0.12], [49, 0.16], [61, 0.20], [73, 0.18], [84, 0.14], [93, 0.08], [99, 0.03]]`, adjusted to fit this persona.
+- For open-ended text questions, usually include 1 or 2 short, distinct answers; occasionally include 3 if several phrasings are genuinely plausible. If the answer should be long-form, 1 candidate answer is usually enough.
+- If a question demands a specific answer format, every candidate answer in that question's distribution must obey it exactly.
+- If a question says English only, every text answer for that question must be in English.
+- Otherwise, use whatever language this person would naturally use.
+- Preserve authentic messiness and uncertainty: the distribution should reflect the range of responses this exact person might give on different days, in different moods, or under slightly different framings.
+
+BEGIN OUTPUT FORMAT
+{
+    "<insert question 1 verbatim here>": [
+        [<insert answer option 1 here>, <insert probability 1 here>],
+        [<insert answer option 2 here>, <insert probability 2 here>]
+    ],
+    "<insert question 2 here>": [
+        [<insert answer option 1 here>, <insert probability 1 here>],
+        [<insert answer option 2 here>, <insert probability 2 here>]
+    ],
+    ...
+}
+END OUTPUT FORMAT
+
+{% if additional_instructions %}
+The user has provided the following additional instructions, clarifications, or labelled examples (if these provided, rely heavily on them to calibrate your judgment).
+If they conflict with the other instructions, these user instructions take precedence.
+
+BEGIN ADDITIONAL INSTRUCTIONS/CLARIFICATIONS
+{{ additional_instructions }}
+END ADDITIONAL INSTRUCTIONS/CLARIFICATIONS
+{% endif %}

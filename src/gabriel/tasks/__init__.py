@@ -35,6 +35,8 @@ _lazy_imports = {
     "DiscoverConfig": ".discover",
     "Seed": ".seed",
     "SeedConfig": ".seed",
+    "Poll": ".poll",
+    "PollConfig": ".poll",
     "Filter": ".filter",
     "FilterConfig": ".filter",
     "Whatever": ".whatever",

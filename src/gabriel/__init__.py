@@ -23,6 +23,7 @@ from .api import (
     view,
     bucket,
     seed,
+    poll,
 )
 from .utils import load
 
@@ -42,6 +43,7 @@ __all__ = list(_tasks.__all__) + [
     "compare",
     "discover",
     "seed",
+    "poll",
     "deduplicate",
     "merge",
     "filter",

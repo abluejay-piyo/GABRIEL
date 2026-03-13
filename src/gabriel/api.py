@@ -34,6 +34,8 @@ from .tasks import (
     DiscoverConfig,
     Seed,
     SeedConfig,
+    Poll,
+    PollConfig,
     Filter,
     FilterConfig,
     Whatever,
@@ -55,6 +57,7 @@ __all__ = [
     "rate",
     "extract",
     "seed",
+    "poll",
     "classify",
     "ideate",
     "id8",
@@ -523,6 +526,178 @@ async def seed(
     task = Seed(cfg, template_path=template_path)
     return await task.run(
         existing_entities=existing_entities,
+        reset_files=reset_files,
+        response_fn=response_fn,
+        get_all_responses_fn=get_all_responses_fn,
+        embedding_fn=embedding_fn,
+        get_all_embeddings_fn=get_all_embeddings_fn,
+        **response_kwargs,
+    )
+
+
+async def poll(
+    df: Optional[pd.DataFrame] = None,
+    column_name: Optional[str] = None,
+    *,
+    population_description: Optional[str] = None,
+    questions: Optional[Union[str, Sequence[str]]] = None,
+    save_dir: str,
+    file_name: str = "poll_results.csv",
+    seed_file_name: str = "poll_seeds.csv",
+    persona_file_name: str = "poll_personas.csv",
+    model: str = "gpt-5.4",
+    seed_model: Optional[str] = None,
+    persona_model: Optional[str] = None,
+    poll_model: Optional[str] = None,
+    n_parallels: int = 650,
+    num_personas: int = 1000,
+    entities_per_generation: int = 50,
+    entity_batch_frac: float = 0.25,
+    existing_entities_cap: int = 100,
+    deduplicate: bool = False,
+    deduplicate_sample_seed: int = 42,
+    n_questions_per_run: int = 8,
+    seed_additional_instructions: Optional[str] = None,
+    additional_instructions: Optional[str] = None,
+    web_search: bool = False,
+    reasoning_effort: Optional[str] = None,
+    seed_template_path: Optional[str] = None,
+    persona_template_path: Optional[str] = None,
+    answer_template_path: Optional[str] = None,
+    reset_files: bool = False,
+    response_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+    get_all_responses_fn: Optional[Callable[..., Awaitable[pd.DataFrame]]] = None,
+    embedding_fn: Optional[Callable[..., Awaitable[Any]]] = None,
+    get_all_embeddings_fn: Optional[Callable[..., Awaitable[Dict[str, List[float]]]]] = None,
+    **cfg_kwargs,
+) -> pd.DataFrame:
+    """Seed a synthetic population, expand it into personas, and survey them.
+
+    Example Use
+    -----------
+    Survey a representative synthetic sample of the U.S. population on one or
+    more poll questions.
+
+    Parameters
+    ----------
+    df:
+        Optional DataFrame containing precomputed respondent seeds. When
+        provided, `population_description` is ignored and the seeding stage is
+        skipped. If the DataFrame already contains a ``persona`` column, the
+        task skips directly to the polling stage and reuses those personas.
+    column_name:
+        Column in ``df`` containing the seed descriptions. If omitted, the task
+        will look for ``"seed"`` and then ``"entity"``. This is optional when
+        reusing an existing ``persona`` column.
+    population_description:
+        Natural-language description of the population to seed when ``df`` is
+        not supplied.
+    questions:
+        A single survey question or a sequence of questions. Questions are
+        answered in JSON and become columns in the returned DataFrame.
+    save_dir:
+        Directory where intermediate and final CSV artifacts are written.
+    file_name:
+        Final CSV written by the poll task.
+    seed_file_name:
+        CSV used for the seeded respondent population.
+    persona_file_name:
+        CSV used for the generated personas before question answering.
+    model:
+        Default model used for all three stages unless a stage-specific model is
+        provided.
+    seed_model / persona_model / poll_model:
+        Optional model overrides for each stage.
+    n_parallels:
+        Maximum concurrent requests for persona generation and polling.
+    num_personas:
+        Number of synthetic respondents to create when seeding a population.
+    entities_per_generation / entity_batch_frac / existing_entities_cap /
+    deduplicate / deduplicate_sample_seed:
+        Seeding controls forwarded to :class:`gabriel.tasks.seed.Seed`.
+    n_questions_per_run:
+        Maximum number of questions bundled into one polling prompt.
+    seed_additional_instructions:
+        Extra guidance appended to the seed-generation instructions.
+    additional_instructions:
+        Extra guidance appended to the poll-answering prompt.
+    web_search:
+        Enable web search augmentation for the polling stage only.
+    reasoning_effort:
+        Controls how intensely the model reasons (none/low/medium/high).
+    seed_template_path / persona_template_path / answer_template_path:
+        Optional Jinja2 template overrides for each prompt stage.
+    reset_files:
+        When ``True`` ignore saved checkpoints and regenerate all stages.
+    response_fn / get_all_responses_fn:
+        Optional overrides for the Responses API execution path.
+    embedding_fn / get_all_embeddings_fn:
+        Optional embedding overrides used by nested seed deduplication.
+    **cfg_kwargs:
+        Additional overrides applied to :class:`gabriel.tasks.poll.PollConfig`.
+        Keys matching :func:`gabriel.utils.openai_utils.get_all_responses` /
+        :func:`gabriel.utils.openai_utils.get_response` (for example
+        ``max_output_tokens``) are forwarded to model calls.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame containing respondent seeds, generated personas, and one
+        column per question when questions are supplied.
+    """
+
+    save_dir = os.path.expandvars(os.path.expanduser(save_dir))
+    os.makedirs(save_dir, exist_ok=True)
+    if df is None and population_description is None:
+        final_path = os.path.join(save_dir, file_name)
+        return _load_cached_dataframe(final_path, task_name="Poll")
+
+    cfg_overrides, response_kwargs = _split_cfg_and_response_kwargs(
+        PollConfig,
+        dict(cfg_kwargs),
+        task_name="poll",
+    )
+    normalized_questions: List[str]
+    if questions is None:
+        normalized_questions = []
+    elif isinstance(questions, str):
+        normalized_questions = [questions]
+    else:
+        normalized_questions = [str(question) for question in questions]
+
+    cfg = PollConfig(
+        population_description=population_description,
+        questions=normalized_questions,
+        save_dir=save_dir,
+        file_name=file_name,
+        seed_file_name=seed_file_name,
+        persona_file_name=persona_file_name,
+        seed_model=seed_model or model,
+        persona_model=persona_model or model,
+        poll_model=poll_model or model,
+        n_parallels=n_parallels,
+        num_personas=num_personas,
+        entities_per_generation=entities_per_generation,
+        entity_batch_frac=entity_batch_frac,
+        existing_entities_cap=existing_entities_cap,
+        deduplicate=deduplicate,
+        deduplicate_sample_seed=deduplicate_sample_seed,
+        n_questions_per_run=n_questions_per_run,
+        seed_additional_instructions=seed_additional_instructions,
+        additional_instructions=additional_instructions,
+        web_search=web_search,
+        reasoning_effort=reasoning_effort,
+        **cfg_overrides,
+    )
+    task = Poll(
+        cfg,
+        seed_template_path=seed_template_path,
+        persona_template_path=persona_template_path,
+        answer_template_path=answer_template_path,
+    )
+    return await task.run(
+        df=df,
+        column_name=column_name,
         reset_files=reset_files,
         response_fn=response_fn,
         get_all_responses_fn=get_all_responses_fn,

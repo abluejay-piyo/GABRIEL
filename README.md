@@ -62,6 +62,7 @@ The tutorial notebook walks through these ideas step-by-step—from setting up a
 | `gabriel.compare` | Identifies similarities / differences between paired items. Output = list of differences. | Contrast op-eds from different districts; compare two ad campaigns. |
 | `gabriel.bucket` | Builds taxonomies from many terms. Output = bucket/cluster labels. | Group technologies, artworks, or HR complaints into emergent categories. |
 | `gabriel.seed` | Enforces a representative distribution / diversity of seeds. | Initialize unique personas that match US population distribution. |
+| `gabriel.poll` | Seeds personas, expands them into full biographies, and surveys them. | Simulate a synthetic opinion poll on policy, trust, and open-ended attitudes. |
 | `gabriel.ideate` | Generates many novel scientific theories and filters the cream of the crop. | Procure novel theories on inflation for potential research. |
 | `gabriel.debias` | Post-process measurements to remove inference bias. | Ensure GPT isn't guessing climate opinions in speeches based on general political lean. |
 | `gabriel.load` | Prepares a folder of text / image / audio files into a spreadsheet for use in GABRIEL. | Image directory converted into spreadsheet of file paths. |
