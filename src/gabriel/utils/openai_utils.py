@@ -441,12 +441,20 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
         "output": 10.00,
         "batch": 0.5,
     },
+    "gpt-audio-1.5": {
+        "input": 2.50,
+        "cached_input": 0.625,
+        "output": 10.00,
+        "batch": 0.5,
+    },
     "gpt-5.2": {"input": 1.75, "cached_input": 0.175, "output": 14.00, "batch": 0.5},
     "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00, "batch": 0.5},
     "gpt-5.1": {"input": 1.25, "cached_input": 0.125, "output": 10.00, "batch": 0.5},
     "gpt-5": {"input": 1.25, "cached_input": 0.125, "output": 10.00, "batch": 0.5},
     "gpt-5-mini": {"input": 0.25, "cached_input": 0.025, "output": 2.00, "batch": 0.5},
     "gpt-5-nano": {"input": 0.05, "cached_input": 0.005, "output": 0.40, "batch": 0.5},
+    "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50, "batch": 0.5},
+    "gpt-5.4-nano": {"input": 0.20, "cached_input": 0.02, "output": 1.25, "batch": 0.5},
     "o3-mini": {"input": 1.10, "cached_input": 0.55, "output": 4.40, "batch": 0.5},
     "o3-deep-research": {
         "input": 10.00,
@@ -461,6 +469,60 @@ MODEL_PRICING: Dict[str, Dict[str, float]] = {
         "batch": 0.5,
     },
 }
+
+VALID_SERVICE_TIERS = {"auto", "default", "flex", "scale", "priority"}
+SERVICE_TIER_PRICE_MULTIPLIERS: Dict[str, float] = {
+    "flex": 0.5,
+    "priority": 2.0,
+}
+
+
+def _normalise_service_tier(value: Optional[str]) -> Optional[str]:
+    """Validate and normalise an optional service-tier override."""
+
+    if value is None:
+        return None
+    try:
+        normalised = str(value).strip().lower()
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError("service_tier must be a string or None") from exc
+    if not normalised or normalised == "none":
+        return None
+    if normalised not in VALID_SERVICE_TIERS:
+        allowed = ", ".join(sorted(VALID_SERVICE_TIERS))
+        raise ValueError(f"service_tier must be one of {{{allowed}}} or None")
+    return normalised
+
+
+def _service_tier_price_multiplier(service_tier: Optional[str]) -> float:
+    """Return the pricing multiplier for a service tier."""
+
+    normalised = _normalise_service_tier(service_tier)
+    if normalised is None:
+        return 1.0
+    return SERVICE_TIER_PRICE_MULTIPLIERS.get(normalised, 1.0)
+
+
+def _service_tier_pricing_note(service_tier: Optional[str]) -> Optional[str]:
+    """Return a user-facing note describing service-tier pricing behavior."""
+
+    normalised = _normalise_service_tier(service_tier)
+    if normalised is None:
+        return None
+    if normalised == "priority":
+        return (
+            "Service tier 'priority' requested: cost estimates are priced at 2x "
+            "standard rates. The API response may report the actual tier used."
+        )
+    if normalised == "flex":
+        return (
+            "Service tier 'flex' requested: cost estimates are priced at 0.5x "
+            "standard rates. The API response may report the actual tier used."
+        )
+    return (
+        f"Service tier '{normalised}' requested: forwarding it to the API. "
+        "The API response may report the actual tier used."
+    )
 
 
 def _print_tier_explainer(verbose: bool = True) -> None:
@@ -534,6 +596,7 @@ def _estimate_cost(
     sample_size: int = _ESTIMATION_SAMPLE_SIZE,
     estimated_output_tokens_per_prompt: int = ESTIMATED_OUTPUT_TOKENS_PER_PROMPT,
     extra_input_tokens_per_prompt: int = 0,
+    service_tier: Optional[str] = None,
 ) -> Optional[Dict[str, float]]:
     """Estimate input/output tokens and cost for a set of prompts.
 
@@ -545,6 +608,8 @@ def _estimate_cost(
     pricing = _lookup_model_pricing(model)
     if pricing is None:
         return None
+    resolved_service_tier = _normalise_service_tier(service_tier)
+    pricing_multiplier = _service_tier_price_multiplier(resolved_service_tier)
     # Estimate tokens: sample large datasets to avoid long start-up times.
     total_prompts = len(prompts)
     if total_prompts == 0:
@@ -573,12 +638,16 @@ def _estimate_cost(
     if use_batch:
         cost_in *= pricing["batch"]
         cost_out *= pricing["batch"]
+    cost_in *= pricing_multiplier
+    cost_out *= pricing_multiplier
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "input_cost": cost_in,
         "output_cost": cost_out,
         "total_cost": cost_in + cost_out,
+        "pricing_multiplier": pricing_multiplier,
+        "service_tier": resolved_service_tier,
     }
 
 
@@ -822,6 +891,7 @@ def _print_run_banner(
     modality: Optional[str],
     web_search: bool,
     reasoning_effort: Optional[str],
+    service_tier: Optional[str],
     estimated_cost: Optional[Dict[str, float]],
     max_output_tokens: Optional[int],
     stats: Dict[str, Any],
@@ -845,6 +915,9 @@ def _print_run_banner(
     print(
         f"Model: {model} | {reasoning_segment} | Mode: {'batch' if use_batch else 'streaming'}{modality_segment}"
     )
+    service_tier_note = _service_tier_pricing_note(service_tier)
+    if service_tier_note:
+        print(service_tier_note)
     pricing = _lookup_model_pricing(model)
     if pricing:
         print(
@@ -944,7 +1017,7 @@ def _require_api_key() -> str:
 
 
 def _get_rate_limit_headers(
-    model: str = "gpt-5-mini", base_url: Optional[str] = None
+    model: str = "gpt-5.4-mini", base_url: Optional[str] = None
 ) -> Optional[Dict[str, str]]:
     """Retrieve rate‑limit headers via a cheap API request.
 
@@ -1617,6 +1690,7 @@ def _build_params(
     expected_schema: Optional[Dict[str, Any]] = None,
     reasoning_effort: Optional[str] = None,
     reasoning_summary: Optional[str] = None,
+    service_tier: Optional[str] = None,
     include: Optional[Union[str, Iterable[str]]] = None,
     **extra: Any,
 ) -> Dict[str, Any]:
@@ -1632,7 +1706,7 @@ def _build_params(
     Parameters
     ----------
     model:
-        Identifier of the model to query (e.g. ``"gpt-5-mini"``).
+        Identifier of the model to query (e.g. ``"gpt-5.4-mini"``).
     input_data:
         A list representing the conversation so far.  Each element is a mapping
         with ``role`` and ``content`` keys in the format required by the API.
@@ -1667,6 +1741,10 @@ def _build_params(
         (``none``, ``low``, ``medium``, ``high``). Higher values are typically
         smarter but slower. ``reasoning_summary`` requests a concise reasoning
         summary when supported.
+    service_tier:
+        Optional service-tier override forwarded to the API. Supported values
+        are ``"auto"``, ``"default"``, ``"flex"``, ``"scale"``, and
+        ``"priority"``. ``None`` omits the parameter entirely.
     include:
         Optional list (or comma-separated string) of ``include`` fields to
         request from the Responses API. When ``web_search`` is enabled, the
@@ -1687,6 +1765,9 @@ def _build_params(
         "input": input_data,
         "truncation": "auto",
     }
+    resolved_service_tier = _normalise_service_tier(service_tier)
+    if resolved_service_tier is not None:
+        params["service_tier"] = resolved_service_tier
     if max_output_tokens is not None:
         params["max_output_tokens"] = max_output_tokens
     if json_mode:
@@ -1745,7 +1826,7 @@ def _build_params(
 async def get_response(
     prompt: str,
     *,
-    model: str = "gpt-5-mini",
+    model: str = "gpt-5.4-mini",
     n: int = 1,
     max_output_tokens: Optional[int] = None,
     timeout: Optional[float] = None,
@@ -1759,6 +1840,7 @@ async def get_response(
     search_context_size: str = "medium",
     reasoning_effort: Optional[str] = None,
     reasoning_summary: Optional[str] = None,
+    service_tier: Optional[str] = None,
     include: Optional[Union[str, Iterable[str]]] = None,
     use_dummy: bool = False,
     base_url: Optional[str] = None,
@@ -1816,11 +1898,13 @@ async def get_response(
         (``city``, ``country``, ``region``, ``timezone`` and ``type`` – typically
         ``"approximate"``) to guide search results when ``web_search`` is
         enabled.
-    include:
+    include, service_tier:
         Optional ``include`` values forwarded to the Responses API. When
         ``web_search`` is enabled, ``web_search_call.action.sources`` is added
         automatically (without duplicating caller-provided values) so sources
-        are available in the returned payloads.
+        are available in the returned payloads. ``service_tier`` supports
+        ``"auto"``, ``"default"``, ``"flex"``, ``"scale"``, ``"priority"``,
+        or ``None`` to omit the parameter.
     reasoning_effort, reasoning_summary:
         Additional reasoning controls for modern models.
     use_dummy:
@@ -1876,6 +1960,7 @@ async def get_response(
             "Web search cannot be combined with JSON mode; disabling JSON mode."
         )
         json_mode = False
+    service_tier = _normalise_service_tier(service_tier)
     normalised_image_detail = _normalise_image_detail(image_detail)
     # Use dummy for testing without calling the API
     if use_dummy:
@@ -2043,6 +2128,8 @@ async def get_response(
             "messages": messages,
             "temperature": temperature,
         }
+        if service_tier is not None:
+            params_chat["service_tier"] = service_tier
         if audio_model:
             params_chat.setdefault("modalities", ["text"])
         if tools is not None:
@@ -2166,6 +2253,7 @@ async def get_response(
             expected_schema=expected_schema,
             reasoning_effort=reasoning_effort,
             reasoning_summary=reasoning_summary,
+            service_tier=service_tier,
             include=include,
             **kwargs,
         )
@@ -3517,7 +3605,7 @@ async def get_all_responses(
     prompt_pdfs: Optional[Dict[str, List[Dict[str, str]]]] = None,
     prompt_web_search_filters: Optional[Dict[str, Dict[str, Any]]] = None,
     *,
-    model: str = "gpt-5-mini",
+    model: str = "gpt-5.4-mini",
     modality: Optional[str] = None,
     image_detail: Optional[str] = None,
     n: int = 1,
@@ -3533,6 +3621,7 @@ async def get_all_responses(
     search_context_size: str = "medium",
     reasoning_effort: Optional[str] = None,
     reasoning_summary: Optional[str] = None,
+    service_tier: Optional[str] = None,
     include: Optional[Union[str, Iterable[str]]] = None,
     dummy_responses: Optional[Dict[str, Union[DummyResponseSpec, Dict[str, Any]]]] = None,
     use_dummy: bool = False,
@@ -3692,6 +3781,12 @@ async def get_all_responses(
     as ``city``, ``country``, ``region``, ``timezone`` and ``type`` – usually
     ``"approximate"``) can be supplied together via ``web_search_filters``.
 
+    ``service_tier`` can be used to forward an explicit processing tier to the
+    OpenAI API. Supported values are ``"auto"``, ``"default"``, ``"flex"``,
+    ``"scale"``, ``"priority"``, or ``None`` to omit the parameter entirely.
+    Cost estimates use 0.5x pricing for ``"flex"`` and 2x pricing for
+    ``"priority"``.
+
     Image inputs can also include an optional ``image_detail`` override. Leave
     this as ``None`` (or pass ``"none"``) to keep current behaviour and let the
     model choose the default detail level.
@@ -3718,6 +3813,7 @@ async def get_all_responses(
     set_log_level(logging_level)
     logger = get_logger(__name__)
     identifiers = prompts if identifiers is None else identifiers
+    service_tier = _normalise_service_tier(service_tier)
     if get_all_responses_fn is not None:
         if response_fn is not None:
             logger.info(
@@ -3824,6 +3920,9 @@ async def get_all_responses(
         web_search=web_search_requested,
         has_media=has_media_payloads,
     )
+    resolved_service_tier = service_tier
+    service_tier_multiplier = _service_tier_price_multiplier(resolved_service_tier)
+    service_tier_note = _service_tier_pricing_note(resolved_service_tier)
     dataset_stats = _estimate_dataset_stats(
         prompts,
         extra_input_tokens_per_prompt=extra_input_tokens_per_prompt,
@@ -3837,6 +3936,7 @@ async def get_all_responses(
         sample_size=_ESTIMATION_SAMPLE_SIZE,
         estimated_output_tokens_per_prompt=estimated_output_tokens_per_prompt,
         extra_input_tokens_per_prompt=extra_input_tokens_per_prompt,
+        service_tier=resolved_service_tier,
     )
     _print_run_banner(
         prompts=prompts,
@@ -3846,12 +3946,15 @@ async def get_all_responses(
         modality=inferred_modality,
         web_search=web_search_requested,
         reasoning_effort=reasoning_effort,
+        service_tier=resolved_service_tier,
         estimated_cost=cost_estimate,
         max_output_tokens=max_output_tokens,
         stats=dataset_stats,
         estimated_output_tokens_per_prompt=estimated_output_tokens_per_prompt,
         verbose=message_verbose,
     )
+    if service_tier_note:
+        logger.info(service_tier_note)
     response_param_names: Set[str] = set()
     response_accepts_var_kw = False
     response_accepts_return_raw = False
@@ -3980,6 +4083,10 @@ async def get_all_responses(
     get_response_kwargs.setdefault("temperature", temperature)
     get_response_kwargs.setdefault("reasoning_effort", reasoning_effort)
     get_response_kwargs.setdefault("reasoning_summary", reasoning_summary)
+    if resolved_service_tier is None:
+        get_response_kwargs.pop("service_tier", None)
+    else:
+        get_response_kwargs.setdefault("service_tier", resolved_service_tier)
     resolved_image_detail = _normalise_image_detail(
         get_response_kwargs.get("image_detail", image_detail)
     )
@@ -4163,7 +4270,10 @@ async def get_all_responses(
             reason = pd.to_numeric(df["Reasoning Tokens"], errors="coerce").fillna(0)
         else:
             reason = pd.Series([0] * len(df))
-        df["Cost"] = (inp / 1_000_000) * pricing["input"] + ((out + reason) / 1_000_000) * pricing["output"]
+        df["Cost"] = (
+            (inp / 1_000_000) * pricing["input"]
+            + ((out + reason) / 1_000_000) * pricing["output"]
+        ) * service_tier_multiplier
         total_cost = df["Cost"].sum()
         if len(df) > 0:
             avg_row = total_cost / len(df)
@@ -4526,7 +4636,7 @@ async def get_all_responses(
             for prompt, ident in todo_pairs:
                 imgs = prompt_images.get(str(ident)) if prompt_images else None
                 pdfs = prompt_pdfs.get(str(ident)) if prompt_pdfs else None
-                model_name = get_response_kwargs.get("model", "gpt-5-mini")
+                model_name = get_response_kwargs.get("model", "gpt-5.4-mini")
                 legacy_system_instruction = _uses_legacy_system_instruction(model_name)
                 if imgs or pdfs:
                     contents: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
@@ -4606,6 +4716,7 @@ async def get_all_responses(
                     reasoning_summary=get_response_kwargs.get(
                         "reasoning_summary"
                     ),
+                    service_tier=get_response_kwargs.get("service_tier"),
                     include=get_response_kwargs.get("include"),
                 )
                 tasks.append(
@@ -5332,7 +5443,7 @@ async def get_all_responses(
         total_cost = (
             (inp / 1_000_000) * pricing["input"]
             + ((out + reason) / 1_000_000) * pricing["output"]
-        ).sum()
+        ).sum() * service_tier_multiplier
         return (float(total_cost) * scale, sample)
 
     def _aggregate_usage(raw_items: List[Any]) -> Tuple[int, int, int]:
@@ -5517,6 +5628,8 @@ async def get_all_responses(
             batch_multiplier = pricing.get("batch", 1.0) if use_batch else 1.0
             input_cost *= batch_multiplier
             output_cost *= batch_multiplier
+            input_cost *= service_tier_multiplier
+            output_cost *= service_tier_multiplier
             cost_line = (
                 f"Updated estimated total cost: ~${(input_cost + output_cost):.2f} "
                 f"(input ${input_cost:.2f}, output ${output_cost:.2f}). "

@@ -170,6 +170,88 @@ def test_build_params_normalises_search_context_size_aliases():
     assert web_tool["search_context_size"] == "high"
 
 
+def test_build_params_normalises_service_tier_and_omits_none():
+    params = openai_utils._build_params(
+        model="gpt-4o-mini",
+        input_data=[{"role": "user", "content": "hello"}],
+        max_output_tokens=None,
+        system_instruction="",
+        temperature=0.7,
+        tools=None,
+        tool_choice=None,
+        web_search=False,
+        web_search_filters=None,
+        search_context_size="medium",
+        json_mode=False,
+        expected_schema=None,
+        reasoning_effort=None,
+        reasoning_summary=None,
+        service_tier="Priority",
+    )
+    assert params["service_tier"] == "priority"
+
+    params_none = openai_utils._build_params(
+        model="gpt-4o-mini",
+        input_data=[{"role": "user", "content": "hello"}],
+        max_output_tokens=None,
+        system_instruction="",
+        temperature=0.7,
+        tools=None,
+        tool_choice=None,
+        web_search=False,
+        web_search_filters=None,
+        search_context_size="medium",
+        json_mode=False,
+        expected_schema=None,
+        reasoning_effort=None,
+        reasoning_summary=None,
+        service_tier=None,
+    )
+    assert "service_tier" not in params_none
+
+
+def test_estimate_cost_applies_service_tier_multiplier():
+    base = openai_utils._estimate_cost(
+        prompts=["one two three"],
+        n=1,
+        max_output_tokens=100,
+        model="gpt-5.4-mini",
+        use_batch=False,
+    )
+    priority = openai_utils._estimate_cost(
+        prompts=["one two three"],
+        n=1,
+        max_output_tokens=100,
+        model="gpt-5.4-mini",
+        use_batch=False,
+        service_tier="priority",
+    )
+    flex = openai_utils._estimate_cost(
+        prompts=["one two three"],
+        n=1,
+        max_output_tokens=100,
+        model="gpt-5.4-mini",
+        use_batch=False,
+        service_tier="flex",
+    )
+
+    assert base is not None
+    assert priority is not None
+    assert flex is not None
+    assert priority["total_cost"] == pytest.approx(base["total_cost"] * 2.0)
+    assert flex["total_cost"] == pytest.approx(base["total_cost"] * 0.5)
+
+
+def test_lookup_model_pricing_supports_gpt_audio_1_5():
+    pricing = openai_utils._lookup_model_pricing("gpt-audio-1.5")
+    assert pricing == {
+        "input": 2.50,
+        "cached_input": 0.625,
+        "output": 10.00,
+        "batch": 0.5,
+    }
+
+
 def test_extract_web_search_sources_recurses_nested_payload():
     raw = [
         {
@@ -350,6 +432,56 @@ def test_get_response_polls_only_when_needed(monkeypatch):
     assert duration >= 0
 
 
+def test_get_response_forwards_service_tier_when_requested(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    openai_utils._clients_async.clear()
+
+    class DummyResponse:
+        def __init__(self):
+            self.status = "completed"
+            self.id = "resp-service-tier"
+            self.output_text = "ok"
+            self.output = []
+            self.error = None
+            self.usage = {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "output_tokens_details": {"reasoning_tokens": 0},
+            }
+
+    class FakeResponses:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return DummyResponse()
+
+    fake_responses = FakeResponses()
+    fake_client = type("FakeClient", (), {"responses": fake_responses})()
+    monkeypatch.setattr(
+        openai_utils, "_get_client", lambda base_url=None, **kwargs: fake_client
+    )
+
+    asyncio.run(
+        openai_utils.get_response(
+            "hi",
+            use_dummy=False,
+            service_tier="priority",
+        )
+    )
+    asyncio.run(
+        openai_utils.get_response(
+            "hi",
+            use_dummy=False,
+            service_tier=None,
+        )
+    )
+
+    assert fake_responses.calls[0]["service_tier"] == "priority"
+    assert "service_tier" not in fake_responses.calls[1]
+
+
 def test_gpt_audio_modalities(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     openai_utils._clients_async.clear()
@@ -379,12 +511,14 @@ def test_gpt_audio_modalities(monkeypatch):
     asyncio.run(
         openai_utils.get_response(
             "hi",
-            model="gpt-audio",
+            model="gpt-audio-1.5",
             audio=[{"data": "abcd", "format": "mp3"}],
+            service_tier="flex",
             use_dummy=False,
         )
     )
     assert DummyClient.captured["modalities"] == ["text"]
+    assert DummyClient.captured["service_tier"] == "flex"
 
 
 def test_custom_base_url(monkeypatch):
@@ -450,7 +584,7 @@ def test_gpt5_temperature_warning(caplog):
     """Ensure gpt-5 models ignore temperature and log a warning."""
     with caplog.at_level("WARNING"):
         params = openai_utils._build_params(
-            model="gpt-5-mini",
+            model="gpt-5.4-mini",
             input_data=[{"role": "user", "content": "hi"}],
             max_output_tokens=None,
             system_instruction="test",
@@ -477,6 +611,23 @@ def test_get_all_responses_dummy(tmp_path):
     assert len(df) == 2
     assert set(["Successful", "Error Log"]).issubset(df.columns)
     assert df["Successful"].all()
+
+
+def test_get_all_responses_service_tier_prints_pricing_note(tmp_path, capsys):
+    asyncio.run(
+        openai_utils.get_all_responses(
+            prompts=["a"],
+            identifiers=["1"],
+            save_path=str(tmp_path / "service_tier.csv"),
+            use_dummy=True,
+            service_tier="priority",
+            n_parallels=1,
+            print_example_prompt=False,
+        )
+    )
+    captured = capsys.readouterr().out
+    assert "Service tier 'priority' requested" in captured
+    assert "2x standard rates" in captured
 
 
 def test_cap_adjustment_error_is_reported_and_recovers(monkeypatch, capsys, tmp_path):
@@ -784,7 +935,7 @@ def test_usage_overview_reports_remaining_budget_reason(capsys):
         prompts=["hello"],
         n=1,
         max_output_tokens=None,
-        model="gpt-5-mini",
+        model="gpt-5.4-mini",
         use_batch=False,
         n_parallels=250,
         rate_headers={

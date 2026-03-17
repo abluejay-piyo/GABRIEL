@@ -19,7 +19,7 @@ def test_usage_overview_compact_printout(capsys):
         prompts=["hello", "world"],
         n=1,
         max_output_tokens=32,
-        model="gpt-5-mini",
+        model="gpt-5.4-mini",
         use_batch=False,
         n_parallels=4,
         verbose=True,

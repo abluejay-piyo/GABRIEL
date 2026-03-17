@@ -20,7 +20,7 @@ class WhateverConfig:
 
     save_dir: str = "whatever"
     file_name: str = "custom_prompt_responses.csv"
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4-mini"
     json_mode: bool = False
     web_search: Optional[bool] = None
     web_search_filters: Optional[Dict[str, Any]] = None

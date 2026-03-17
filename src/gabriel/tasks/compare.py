@@ -26,7 +26,7 @@ from ..utils.logging import announce_prompt_rendering
 class CompareConfig:
     save_dir: str = "comparison"
     file_name: str = "comparison_responses.csv"
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4-mini"
     n_parallels: int = 650
     n_runs: int = 1
     use_dummy: bool = False

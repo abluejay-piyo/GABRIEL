@@ -29,7 +29,7 @@ class DeduplicateConfig:
 
     save_dir: str = "deduplicate"
     file_name: str = "deduplicate_responses.csv"
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4-mini"
     n_parallels: int = 650
     n_runs: int = 3
     use_dummy: bool = False

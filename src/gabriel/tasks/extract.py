@@ -29,7 +29,7 @@ class ExtractConfig:
     attributes: Dict[str, str]
     save_dir: str = "extraction"
     file_name: str = "extraction.csv"
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4-mini"
     n_parallels: int = 650
     n_runs: int = 1
     use_dummy: bool = False

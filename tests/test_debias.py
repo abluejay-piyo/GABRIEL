@@ -239,7 +239,7 @@ def test_debias_pipeline_codify_flow(monkeypatch, tmp_path):
 
     metadata = result.metadata
     assert metadata["config"]["removal_method"] == "codify"
-    assert metadata["config"]["model"] == "gpt-5-mini"
+    assert metadata["config"]["model"] == "gpt-5.4-mini"
     metadata_path = Path(metadata["metadata_path"])
     assert metadata_path.exists()
     saved_df = pd.read_csv(metadata["result_path"])

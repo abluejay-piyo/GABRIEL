@@ -52,7 +52,7 @@ class ClassifyConfig:
     labels: Dict[str, str]  # {"label_name": "description", ...}
     save_dir: str = "classifier"
     file_name: str = "classify_responses.csv"
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4-mini"
     n_parallels: int = 650
     n_runs: int = 1
     min_frequency: float = 0.6

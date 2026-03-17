@@ -63,7 +63,7 @@ class IdeateConfig:
 
     save_dir: str = os.path.expanduser("~/Documents/runs")
     file_name: str = "ideation.csv"
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.4-mini"
     ranking_model: Optional[str] = None
     n_parallels: int = 650
     n_ideas: int = 1000
