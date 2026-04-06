@@ -310,7 +310,7 @@ class Discover:
                 "use_dummy": self.cfg.use_dummy,
                 "modality": self.cfg.modality,
                 "reasoning_effort": self.cfg.reasoning_effort,
-                "n_attributes_per_run": 8,
+                "n_attributes_per_run": None,
                 "differentiate": True,
                 "additional_instructions": self.cfg.additional_instructions or "",
             }
@@ -474,7 +474,7 @@ class Discover:
                 additional_instructions=self.cfg.additional_instructions or "",
                 modality=self.cfg.modality,
                 reasoning_effort=self.cfg.reasoning_effort,
-                n_attributes_per_run=8,
+                n_attributes_per_run=None,
             )
             clf = Classify(clf_cfg)
             classify_result = await clf.run(

@@ -45,7 +45,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import random
-import hashlib
 import math
 import copy
 from dataclasses import dataclass, field, fields
@@ -70,6 +69,13 @@ from gabriel.utils import (
 from gabriel.utils.logging import announce_prompt_rendering
 from .rate import Rate, RateConfig
 from ._attribute_utils import load_persisted_attributes
+from ._run_utils import (
+    hash_identifier,
+    load_run_metadata,
+    resolve_attribute_batches,
+    resolve_identifier_hash_bits,
+    write_task_run_metadata,
+)
 
 
 def _is_missing_scalar(value: Any) -> bool:
@@ -82,7 +88,12 @@ def _is_missing_scalar(value: Any) -> bool:
     return bool(result) if isinstance(result, (bool, np.bool_)) else False
 
 
-def _hash_text_identifier(value: Any, *, strict: bool) -> Optional[str]:
+def _hash_text_identifier(
+    value: Any,
+    *,
+    strict: bool,
+    bits: int = 64,
+) -> Optional[str]:
     if _is_missing_scalar(value):
         return None
     if isinstance(value, bytes):
@@ -96,7 +107,7 @@ def _hash_text_identifier(value: Any, *, strict: bool) -> Optional[str]:
     text = text.strip()
     if not text:
         return None
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return hash_identifier(text, bits=bits)
 
 
 @dataclass
@@ -189,7 +200,7 @@ class RankConfig:
     additional_instructions: Optional[str] = None
     circle_first: Optional[bool] = None
     modality: str = "text"
-    n_attributes_per_run: int = 8
+    n_attributes_per_run: Optional[int] = None
     reasoning_effort: Optional[str] = None
     # Recursive execution controls
     recursive: bool = False
@@ -427,6 +438,7 @@ class Rank:
         text_column: str,
         item_ids: Sequence[str],
         attr_keys: Sequence[str],
+        identifier_hash_bits: int,
     ) -> Dict[str, Dict[str, float]]:
         if rate_df.empty:
             return {}
@@ -437,7 +449,11 @@ class Rank:
             key_series = rate_df[id_column].astype(str)
         elif text_column in rate_df.columns:
             key_series = rate_df[text_column].map(
-                lambda x: _hash_text_identifier(x, strict=True)
+                lambda x: _hash_text_identifier(
+                    x,
+                    strict=True,
+                    bits=identifier_hash_bits,
+                )
             )
             key_series = key_series.dropna()
         else:
@@ -866,6 +882,7 @@ class Rank:
         current_ratings: Optional[Dict[str, float]],
         se_agg_local: Optional[Dict[str, float]],
         reset_files: bool,
+        identifier_hash_bits: int,
         **kwargs: Any,
     ) -> None:
         if not new_ids:
@@ -920,13 +937,13 @@ class Rank:
                 )
                 for pair_idx, (id_a, id_b) in enumerate(pairs_needed):
                     raw_ident = f"catchup|{rnd}|{batch_idx}|{pair_idx}|{id_a}|{id_b}"
-                    sha8 = hashlib.sha1(raw_ident.encode()).hexdigest()[:8]
+                    hashed_ident = hash_identifier(raw_ident, bits=identifier_hash_bits)
                     circle_first_flag = (
                         self.cfg.circle_first
                         if self.cfg.circle_first is not None
                         else self.rng.random() < 0.5
                     )
-                    id_to_circle_first[sha8] = circle_first_flag
+                    id_to_circle_first[hashed_ident] = circle_first_flag
                     prompts.append(
                         self.template.render(
                             entry_circle=texts_by_id[id_a],
@@ -937,8 +954,8 @@ class Rank:
                             circle_first=circle_first_flag,
                         )
                     )
-                    ids.append(sha8)
-                    meta_map[sha8] = (batch_idx, pair_idx, id_a, id_b)
+                    ids.append(hashed_ident)
+                    meta_map[hashed_ident] = (batch_idx, pair_idx, id_a, id_b)
                     if images_by_id:
                         imgs = []
                         ia = images_by_id.get(id_a, [])
@@ -954,7 +971,7 @@ class Rank:
                             if ia:
                                 imgs.extend(ia)
                         if imgs:
-                            pair_images[sha8] = imgs
+                            pair_images[hashed_ident] = imgs
                     if audio_by_id:
                         auds = []
                         aa = audio_by_id.get(id_a, [])
@@ -970,7 +987,7 @@ class Rank:
                             if aa:
                                 auds.extend(aa)
                         if auds:
-                            pair_audio[sha8] = auds
+                            pair_audio[hashed_ident] = auds
                     if pdfs_by_id:
                         pdfs: List[Dict[str, str]] = []
                         pa = pdfs_by_id.get(id_a, [])
@@ -986,7 +1003,7 @@ class Rank:
                             if pa:
                                 pdfs.extend(pa)
                         if pdfs:
-                            pair_pdfs[sha8] = pdfs
+                            pair_pdfs[hashed_ident] = pdfs
             if not prompts:
                 continue
             resp_df = await get_all_responses(
@@ -1111,6 +1128,7 @@ class Rank:
         *,
         id_column: Optional[str],
         reset_files: bool,
+        identifier_hash_bits: int,
         **kwargs: Any,
     ) -> pd.DataFrame:
         attr_dict = self._attributes_as_dict()
@@ -1143,7 +1161,11 @@ class Rank:
             work_df["identifier"] = work_df[id_column].astype(str)
         else:
             hashed = work_df[text_column].map(
-                lambda x: _hash_text_identifier(x, strict=strict_text_mode)
+                lambda x: _hash_text_identifier(
+                    x,
+                    strict=strict_text_mode,
+                    bits=identifier_hash_bits,
+                )
             )
             valid_mask = hashed.notna()
             dropped = int((~valid_mask).sum())
@@ -1465,6 +1487,19 @@ class Rank:
             to ``save_dir``.
         """
         base_name = os.path.splitext(self.cfg.file_name)[0]
+        checkpoint_paths = [
+            str(path)
+            for path in Path(self.cfg.save_dir).glob(f"{base_name}_round*.csv")
+        ]
+        run_metadata = load_run_metadata(
+            self.cfg.save_dir, base_name, reset_files=reset_files
+        )
+        identifier_hash_bits = resolve_identifier_hash_bits(
+            task_name="Rank",
+            metadata=run_metadata,
+            reset_files=reset_files,
+            checkpoint_paths=checkpoint_paths,
+        )
         self.cfg.attributes = load_persisted_attributes(
             save_dir=self.cfg.save_dir,
             incoming=self.cfg.attributes,
@@ -1481,6 +1516,7 @@ class Rank:
                 column_name,
                 id_column=id_column,
                 reset_files=reset_files,
+                identifier_hash_bits=identifier_hash_bits,
                 **kwargs,
             )
 
@@ -1510,7 +1546,11 @@ class Rank:
             df_proc["_id"] = df_proc[id_column].astype(str)
         else:
             hashed_ids = df_proc[column_name].map(
-                lambda x: _hash_text_identifier(x, strict=strict_text_mode)
+                lambda x: _hash_text_identifier(
+                    x,
+                    strict=strict_text_mode,
+                    bits=identifier_hash_bits,
+                )
             )
             valid_mask = hashed_ids.notna()
             dropped = int((~valid_mask).sum())
@@ -1580,7 +1620,13 @@ class Rank:
                     else:
                         final_ids = set(
                             final_df[identifier_col]
-                            .map(lambda x: _hash_text_identifier(x, strict=True))
+                            .map(
+                                lambda x: _hash_text_identifier(
+                                    x,
+                                    strict=True,
+                                    bits=identifier_hash_bits,
+                                )
+                            )
                             .dropna()
                             .astype(str)
                         )
@@ -1648,6 +1694,7 @@ class Rank:
                 text_column=column_name,
                 item_ids=item_ids,
                 attr_keys=attr_keys,
+                identifier_hash_bits=identifier_hash_bits,
             )
             if rate_seed:
                 print(
@@ -1665,21 +1712,39 @@ class Rank:
             a: {i: np.nan for i in item_ids} for a in attr_keys
         }
         # Define attribute batches once to reuse across replay and new rounds
-        attr_count = len(attr_keys)
-        if attr_count > self.cfg.n_attributes_per_run:
-            batches = (
-                attr_count + self.cfg.n_attributes_per_run - 1
-            ) // self.cfg.n_attributes_per_run
-            print(
-                f"[Rank] {attr_count} attributes provided. n_attributes_per_run={self.cfg.n_attributes_per_run}. "
-                f"Splitting into {batches} prompt batches. Increase n_attributes_per_run if you want all attributes "
-                "to be processed in the same prompt."
-            )
+        attr_items = [(attr, attr) for attr in attr_keys]
+        attr_batch_items, effective_n_attributes_per_run = resolve_attribute_batches(
+            task_name="Rank",
+            items=attr_items,
+            requested_n=self.cfg.n_attributes_per_run,
+            metadata=run_metadata,
+            reset_files=reset_files,
+            checkpoint_paths=checkpoint_paths,
+        )
         attr_batches: List[List[str]] = [
-            attr_keys[i : i + self.cfg.n_attributes_per_run]
-            for i in range(0, len(attr_keys), self.cfg.n_attributes_per_run)
+            [name for name, _ in batch] for batch in attr_batch_items
         ]
-
+        attr_count = len(attr_keys)
+        if (
+            effective_n_attributes_per_run is not None
+            and attr_count > effective_n_attributes_per_run
+        ):
+            batches = (
+                attr_count + effective_n_attributes_per_run - 1
+            ) // effective_n_attributes_per_run
+            print(
+                f"[Rank] {attr_count} attributes provided. n_attributes_per_run={effective_n_attributes_per_run}. "
+                f"Splitting into {batches} prompt batches; set n_attributes_per_run=None to process them together."
+            )
+        write_task_run_metadata(
+            save_dir=self.cfg.save_dir,
+            base_name=base_name,
+            task_name="Rank",
+            model=self.cfg.model,
+            identifier_hash_bits=identifier_hash_bits,
+            n_attributes_per_run=effective_n_attributes_per_run,
+            attribute_batches=attr_batch_items,
+        )
 
         # Helper function to write the current results to the final CSV.  This
         # builds the output DataFrame from the current ``df_proc`` and
@@ -1914,6 +1979,7 @@ class Rank:
             current_ratings=None,
             se_agg_local=self._last_se_agg,
             reset_files=reset_files,
+            identifier_hash_bits=identifier_hash_bits,
             **kwargs,
         )
 
@@ -1952,13 +2018,13 @@ class Rank:
                 )
                 for pair_idx, ((id_a, t_a), (id_b, t_b)) in enumerate(pairs):
                     raw_ident = f"{rnd}|{batch_idx}|{pair_idx}|{id_a}|{id_b}"
-                    sha8 = hashlib.sha1(raw_ident.encode()).hexdigest()[:8]
+                    hashed_ident = hash_identifier(raw_ident, bits=identifier_hash_bits)
                     circle_first_flag = (
                         self.cfg.circle_first
                         if self.cfg.circle_first is not None
                         else self.rng.random() < 0.5
                     )
-                    id_to_circle_first[sha8] = circle_first_flag
+                    id_to_circle_first[hashed_ident] = circle_first_flag
                     prompts.append(
                         self.template.render(
                             entry_circle=t_a,
@@ -1970,8 +2036,8 @@ class Rank:
                             circle_first=circle_first_flag,
                         )
                     )
-                    ids.append(sha8)
-                    meta_map[sha8] = (batch_idx, pair_idx, id_a, id_b)
+                    ids.append(hashed_ident)
+                    meta_map[hashed_ident] = (batch_idx, pair_idx, id_a, id_b)
                     if images_by_id:
                         imgs = []
                         ia = images_by_id.get(id_a, [])
@@ -1987,7 +2053,7 @@ class Rank:
                             if ia:
                                 imgs.extend(ia)
                         if imgs:
-                            pair_images[sha8] = imgs
+                            pair_images[hashed_ident] = imgs
                     if audio_by_id:
                         auds = []
                         aa = audio_by_id.get(id_a, [])
@@ -2003,7 +2069,7 @@ class Rank:
                             if aa:
                                 auds.extend(aa)
                         if auds:
-                            pair_audio[sha8] = auds
+                            pair_audio[hashed_ident] = auds
                     if pdfs_by_id:
                         pdfs: List[Dict[str, str]] = []
                         pa = pdfs_by_id.get(id_a, [])
@@ -2019,7 +2085,7 @@ class Rank:
                             if pa:
                                 pdfs.extend(pa)
                         if pdfs:
-                            pair_pdfs[sha8] = pdfs
+                            pair_pdfs[hashed_ident] = pdfs
             # obtain responses from the language model for this round
             round_path = os.path.join(self.cfg.save_dir, f"{base_name}_round{rnd}.csv")
             resp_df = await get_all_responses(

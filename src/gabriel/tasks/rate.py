@@ -4,8 +4,6 @@
 # ════════════════════════════════════════════════════════════════════
 from __future__ import annotations
 
-import hashlib
-import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, DefaultDict, Dict, List, Optional, Set
@@ -26,6 +24,13 @@ from ..utils import (
 from ..utils.logging import announce_prompt_rendering
 from ..utils.file_utils import save_dataframe_with_fallback
 from ._attribute_utils import load_persisted_attributes
+from ._run_utils import (
+    hash_identifier,
+    load_run_metadata,
+    resolve_attribute_batches,
+    resolve_identifier_hash_bits,
+    write_task_run_metadata,
+)
 
 
 # ────────────────────────────
@@ -43,7 +48,7 @@ class RateConfig:
     rating_scale: Optional[str] = None
     additional_instructions: Optional[str] = None
     modality: str = "text"
-    n_attributes_per_run: int = 8
+    n_attributes_per_run: Optional[int] = None
     reasoning_effort: Optional[str] = None
     search_context_size: str = "medium"
 
@@ -110,6 +115,16 @@ class Rate:
         values = df_proc[column_name].tolist()
         texts = [str(v) for v in values]
         base_name = os.path.splitext(self.cfg.file_name)[0]
+        csv_path = os.path.join(self.cfg.save_dir, f"{base_name}_raw_responses.csv")
+        run_metadata = load_run_metadata(
+            self.cfg.save_dir, base_name, reset_files=reset_files
+        )
+        identifier_hash_bits = resolve_identifier_hash_bits(
+            task_name="Rate",
+            metadata=run_metadata,
+            reset_files=reset_files,
+            checkpoint_paths=[csv_path],
+        )
 
         warn_if_modality_mismatch(values, self.cfg.modality, column_name=column_name)
 
@@ -120,14 +135,16 @@ class Rate:
         row_ids: List[str] = []
 
         for row, (passage, orig) in enumerate(zip(texts, values)):
-            sha8 = hashlib.sha1(passage.encode()).hexdigest()[:8]
-            row_ids.append(sha8)
-            id_to_rows[sha8].append(row)
-            if len(id_to_rows[sha8]) > 1:
+            ident = hash_identifier(passage, bits=identifier_hash_bits)
+            row_ids.append(ident)
+            id_to_rows[ident].append(row)
+            if len(id_to_rows[ident]) > 1:
                 continue
-            id_to_val[sha8] = orig
-            prompt_texts[sha8] = passage if self.cfg.modality in {"text", "entity", "web"} else ""
-            base_ids.append(sha8)
+            id_to_val[ident] = orig
+            prompt_texts[ident] = (
+                passage if self.cfg.modality in {"text", "entity", "web"} else ""
+            )
+            base_ids.append(ident)
 
         df_proc["_gid"] = row_ids
 
@@ -140,22 +157,37 @@ class Rate:
             legacy_filename=f"{base_name}_attrs.json",
         )
 
-        if not isinstance(self.cfg.n_attributes_per_run, int) or self.cfg.n_attributes_per_run < 1:
-            raise ValueError("n_attributes_per_run must be an integer >= 1")
-
         attr_items = list(self.cfg.attributes.items())
+        attr_batch_items, effective_n_attributes_per_run = resolve_attribute_batches(
+            task_name="Rate",
+            items=attr_items,
+            requested_n=self.cfg.n_attributes_per_run,
+            metadata=run_metadata,
+            reset_files=reset_files,
+            checkpoint_paths=[csv_path],
+        )
+        attr_batches: List[Dict[str, str]] = [dict(batch) for batch in attr_batch_items]
         attr_count = len(attr_items)
-        if attr_count > self.cfg.n_attributes_per_run:
-            batches = (attr_count + self.cfg.n_attributes_per_run - 1) // self.cfg.n_attributes_per_run
+        if (
+            effective_n_attributes_per_run is not None
+            and attr_count > effective_n_attributes_per_run
+        ):
+            batches = (
+                attr_count + effective_n_attributes_per_run - 1
+            ) // effective_n_attributes_per_run
             print(
-                f"[Rate] {attr_count} attributes provided. n_attributes_per_run={self.cfg.n_attributes_per_run}. "
-                f"Splitting into {batches} prompt batches. Increase n_attributes_per_run if you want all attributes "
-                "to be processed in the same prompt."
+                f"[Rate] {attr_count} attributes provided. n_attributes_per_run={effective_n_attributes_per_run}. "
+                f"Splitting into {batches} prompt batches; set n_attributes_per_run=None to process them together."
             )
-        attr_batches: List[Dict[str, str]] = [
-            dict(attr_items[i : i + self.cfg.n_attributes_per_run])
-            for i in range(0, len(attr_items), self.cfg.n_attributes_per_run)
-        ]
+        write_task_run_metadata(
+            save_dir=self.cfg.save_dir,
+            base_name=base_name,
+            task_name="Rate",
+            model=self.cfg.model,
+            identifier_hash_bits=identifier_hash_bits,
+            n_attributes_per_run=effective_n_attributes_per_run,
+            attribute_batches=attr_batch_items,
+        )
 
         prompts: List[str] = []
         ids: List[str] = []
@@ -206,7 +238,6 @@ class Rate:
                         tmp_p[f"{ident}_batch{batch_idx}"] = pdfs
             prompt_pdfs = tmp_p or None
 
-        csv_path = os.path.join(self.cfg.save_dir, f"{base_name}_raw_responses.csv")
         kwargs.setdefault("web_search", self.cfg.modality == "web")
         kwargs.setdefault("search_context_size", self.cfg.search_context_size)
 

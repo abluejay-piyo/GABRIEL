@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import random
 from dataclasses import dataclass
@@ -20,6 +19,12 @@ from ..utils import (
     warn_if_modality_mismatch,
 )
 from ..utils.logging import announce_prompt_rendering
+from ._run_utils import (
+    hash_identifier,
+    load_run_metadata,
+    resolve_identifier_hash_bits,
+    write_task_run_metadata,
+)
 
 
 @dataclass
@@ -88,6 +93,26 @@ class Compare:
         circles = df_proc[circle_column_name].tolist()
         squares = df_proc[square_column_name].tolist()
         pairs = list(zip(circles, squares))
+        base_name = os.path.splitext(self.cfg.file_name)[0]
+        csv_path = os.path.join(self.cfg.save_dir, self.cfg.file_name)
+        run_metadata = load_run_metadata(
+            self.cfg.save_dir, base_name, reset_files=reset_files
+        )
+        identifier_hash_bits = resolve_identifier_hash_bits(
+            task_name="Compare",
+            metadata=run_metadata,
+            reset_files=reset_files,
+            checkpoint_paths=[csv_path],
+        )
+        write_task_run_metadata(
+            save_dir=self.cfg.save_dir,
+            base_name=base_name,
+            task_name="Compare",
+            model=self.cfg.model,
+            identifier_hash_bits=identifier_hash_bits,
+            n_attributes_per_run=None,
+            attribute_batches=[],
+        )
 
         warn_if_modality_mismatch(circles, self.cfg.modality, column_name=circle_column_name)
         warn_if_modality_mismatch(squares, self.cfg.modality, column_name=square_column_name)
@@ -98,7 +123,7 @@ class Compare:
         prompt_circle_text: Dict[str, str] = {}
         prompt_square_text: Dict[str, str] = {}
         for circle, square in pairs:
-            ident = hashlib.sha1(f"{circle}|{square}".encode()).hexdigest()[:8]
+            ident = hash_identifier(f"{circle}|{square}", bits=identifier_hash_bits)
             ids.append(ident)
             circle_first_flag = (
                 self.cfg.circle_first
@@ -187,8 +212,6 @@ class Compare:
                 if pdfs:
                     tmp_p[ident] = pdfs
             prompt_pdfs = tmp_p or None
-
-        csv_path = os.path.join(self.cfg.save_dir, self.cfg.file_name)
 
         kwargs.setdefault("web_search", self.cfg.modality == "web")
 

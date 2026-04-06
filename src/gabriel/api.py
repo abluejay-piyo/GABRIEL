@@ -194,7 +194,7 @@ async def rate(
     model: str = "gpt-5.4-mini",
     n_parallels: int = 650,
     n_runs: int = 1,
-    n_attributes_per_run: int = 8,
+    n_attributes_per_run: Optional[int] = None,
     reset_files: bool = False,
     file_name: str = "ratings.csv",
     modality: str = "text",
@@ -234,8 +234,9 @@ async def rate(
     n_runs:
         Number of repeat rating passes to perform for each passage.
     n_attributes_per_run:
-        Maximum number of attributes to include in a single prompt. Attributes
-        are split across prompts when this limit is exceeded.
+        Maximum number of attributes to include in a single prompt. When set
+        to an integer, larger attribute sets are split across multiple prompts;
+        when ``None``, all attributes are processed in one prompt.
     reset_files:
         When ``True`` existing outputs in ``save_dir`` are ignored and
         regenerated.
@@ -312,7 +313,7 @@ async def extract(
     model: str = "gpt-5.4-mini",
     n_parallels: int = 650,
     n_runs: int = 1,
-    n_attributes_per_run: int = 8,
+    n_attributes_per_run: Optional[int] = None,
     reset_files: bool = False,
     file_name: str = "extraction.csv",
     modality: str = "entity",
@@ -350,8 +351,9 @@ async def extract(
         Number of extraction passes to perform; results are averaged when
         applicable.
     n_attributes_per_run:
-        Maximum number of attributes to include in each prompt. Attributes are
-        split into multiple prompts when this threshold is exceeded.
+        Maximum number of attributes to include in each prompt. When set to an
+        integer, larger attribute sets are split across multiple prompts; when
+        ``None``, all attributes are processed in one prompt.
     reset_files:
         When ``True`` forces regeneration of outputs in ``save_dir``.
     file_name:
@@ -720,7 +722,7 @@ async def classify(
     square_column_name: Optional[str] = None,
     n_parallels: int = 650,
     n_runs: int = 1,
-    n_attributes_per_run: int = 8,
+    n_attributes_per_run: Optional[int] = None,
     min_frequency: float = 0.6,
     reset_files: bool = False,
     file_name: str = "classify_responses.csv",
@@ -763,8 +765,9 @@ async def classify(
     n_runs:
         Number of repeated classification passes.
     n_attributes_per_run:
-        Maximum number of labels to evaluate per prompt. Labels are split into
-        batches when this count is exceeded.
+        Maximum number of labels to evaluate per prompt. When set to an
+        integer, larger label sets are split across multiple prompts; when
+        ``None``, all labels are evaluated in one prompt.
     min_frequency:
         Minimum label frequency required to keep a label during aggregation.
     reset_files:
@@ -1140,7 +1143,7 @@ async def rank(
     return_raw_scores: bool = False,
     learning_rate: float = 0.1,
     n_parallels: int = 650,
-    n_attributes_per_run: int = 8,
+    n_attributes_per_run: Optional[int] = None,
     file_name: str = "rankings",
     reset_files: bool = False,
     modality: str = "text",
@@ -1194,8 +1197,9 @@ async def rank(
     n_parallels:
         Maximum concurrent ranking calls.
     n_attributes_per_run:
-        Maximum number of attributes to compare per prompt. Attributes are
-        batched across prompts when this cap is exceeded.
+        Maximum number of attributes to compare per prompt. When set to an
+        integer, larger attribute sets are split across multiple prompts; when
+        ``None``, all attributes are compared in one prompt.
     file_name:
         Base filename for saved rankings (without extension).
     reset_files:

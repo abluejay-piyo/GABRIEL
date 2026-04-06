@@ -1097,6 +1097,121 @@ def test_ratings_ignore_stale_ids(tmp_path):
     assert "helpfulness" in df.columns
 
 
+def test_ratings_default_uses_64_bit_ids_and_single_attribute_batch(tmp_path, capsys):
+    attrs = {f"attr_{idx}": "" for idx in range(13)}
+    calls: List[Dict[str, Any]] = []
+
+    async def custom_driver(prompts, identifiers, **_kwargs):
+        calls.append({"prompts": prompts, "identifiers": identifiers})
+        payload = json.dumps({attr: idx for idx, attr in enumerate(attrs)})
+        return pd.DataFrame(
+            {
+                "Identifier": identifiers,
+                "Response": [[payload] for _ in identifiers],
+            }
+        )
+
+    cfg = RateConfig(
+        attributes=attrs,
+        save_dir=str(tmp_path),
+        file_name="ratings.csv",
+    )
+    task = Rate(cfg)
+    data = pd.DataFrame({"text": ["hello"]})
+    df = asyncio.run(
+        task.run(data, column_name="text", get_all_responses_fn=custom_driver)
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["identifiers"] == ["aaf4c61ddcc5e8a2_batch0"]
+    assert len(calls[0]["prompts"]) == 1
+    assert df.loc[0, "attr_12"] == 12.0
+    output = capsys.readouterr().out
+    assert "Processing 13 attributes in one prompt" in output
+    metadata = json.loads((tmp_path / "ratings_run_metadata.json").read_text())
+    assert metadata["identifier_hash_bits"] == 64
+    assert metadata["n_attributes_per_run"] is None
+
+
+def test_ratings_legacy_32_bit_checkpoint_resumes(tmp_path, capsys):
+    raw_path = tmp_path / "ratings_raw_responses.csv"
+    pd.DataFrame(
+        [
+            {
+                "Identifier": "aaf4c61d_batch0",
+                "Response": openai_utils._ser(['{"helpfulness": 42}']),
+                "Time Taken": 0.1,
+                "Input Tokens": 1,
+                "Reasoning Tokens": 0,
+                "Output Tokens": 1,
+                "Reasoning Effort": None,
+                "Successful": True,
+                "Error Log": openai_utils._ser(None),
+            }
+        ]
+    ).to_csv(raw_path, index=False)
+
+    cfg = RateConfig(
+        attributes={"helpfulness": ""},
+        save_dir=str(tmp_path),
+        file_name="ratings.csv",
+        use_dummy=True,
+    )
+    task = Rate(cfg)
+    data = pd.DataFrame({"text": ["hello"]})
+    df = asyncio.run(task.run(data, column_name="text"))
+
+    assert df.loc[0, "helpfulness"] == 42.0
+    output = capsys.readouterr().out
+    assert "using legacy 32-bit IDs" in output
+    metadata = json.loads((tmp_path / "ratings_run_metadata.json").read_text())
+    assert metadata["identifier_hash_bits"] == 32
+
+
+def test_ratings_legacy_checkpoint_infers_attribute_batches(tmp_path, capsys):
+    attrs = {f"attr_{idx}": "" for idx in range(25)}
+    raw_path = tmp_path / "ratings_raw_responses.csv"
+    base_id = "aaf4c61d"
+    rows = []
+    for batch_idx, start in enumerate((0, 10, 20)):
+        batch_attrs = list(attrs)[start : start + 10]
+        rows.append(
+            {
+                "Identifier": f"{base_id}_batch{batch_idx}",
+                "Response": openai_utils._ser(
+                    [json.dumps({attr: idx for idx, attr in enumerate(batch_attrs, start)})]
+                ),
+                "Time Taken": 0.1,
+                "Input Tokens": 1,
+                "Reasoning Tokens": 0,
+                "Output Tokens": 1,
+                "Reasoning Effort": None,
+                "Successful": True,
+                "Error Log": openai_utils._ser(None),
+            }
+        )
+    pd.DataFrame(rows).to_csv(raw_path, index=False)
+
+    cfg = RateConfig(
+        attributes=attrs,
+        save_dir=str(tmp_path),
+        file_name="ratings.csv",
+        use_dummy=True,
+    )
+    task = Rate(cfg)
+    data = pd.DataFrame({"text": ["hello"]})
+    df = asyncio.run(task.run(data, column_name="text"))
+
+    assert df.loc[0, "attr_0"] == 0.0
+    assert df.loc[0, "attr_12"] == 12.0
+    assert df.loc[0, "attr_24"] == 24.0
+    output = capsys.readouterr().out
+    assert "reusing them so cached responses line up" in output
+    metadata = json.loads((tmp_path / "ratings_run_metadata.json").read_text())
+    assert metadata["identifier_hash_bits"] == 32
+    assert [len(batch) for batch in metadata["attribute_batches"]] == [10, 10, 5]
+
+
 def test_ratings_audio_dummy(tmp_path):
     cfg = RateConfig(
         attributes={"clarity": ""},
@@ -1808,7 +1923,7 @@ def test_extract_custom_response_functions(tmp_path):
         )
     )
     assert len(calls) == 1
-    assert calls[0][1] == ["aaf4c61d_batch0"]
+    assert calls[0][1] == ["aaf4c61ddcc5e8a2_batch0"]
     assert "hello" in calls[0][0][0]
     assert custom_driver_response.loc[0, "entity_name"] == "hello"
     assert custom_driver_response.loc[0, "year"] == "1999"

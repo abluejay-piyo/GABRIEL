@@ -1,5 +1,4 @@
 from __future__ import annotations
-import hashlib
 import os
 from pathlib import Path
 import re
@@ -23,6 +22,13 @@ from ..utils import (
 from ..utils.logging import announce_prompt_rendering
 from ..utils.file_utils import save_dataframe_with_fallback
 from ._attribute_utils import load_persisted_attributes
+from ._run_utils import (
+    hash_identifier,
+    load_run_metadata,
+    resolve_attribute_batches,
+    resolve_identifier_hash_bits,
+    write_task_run_metadata,
+)
 
 
 def _collect_predictions(row: pd.Series) -> List[str]:
@@ -59,7 +65,7 @@ class ClassifyConfig:
     additional_instructions: Optional[str] = None
     use_dummy: bool = False
     modality: str = "text"
-    n_attributes_per_run: int = 8
+    n_attributes_per_run: Optional[int] = None
     reasoning_effort: Optional[str] = None
     differentiate: bool = False
     circle_first: Optional[bool] = None
@@ -173,6 +179,16 @@ class Classify:
 
         df_proc = df.reset_index(drop=True).copy()
         base_name = os.path.splitext(self.cfg.file_name)[0]
+        csv_path = os.path.join(self.cfg.save_dir, f"{base_name}_raw_responses.csv")
+        run_metadata = load_run_metadata(
+            self.cfg.save_dir, base_name, reset_files=reset_files
+        )
+        identifier_hash_bits = resolve_identifier_hash_bits(
+            task_name="Classify",
+            metadata=run_metadata,
+            reset_files=reset_files,
+            checkpoint_paths=[csv_path],
+        )
 
         self.cfg.labels = load_persisted_attributes(
             save_dir=self.cfg.save_dir,
@@ -183,24 +199,37 @@ class Classify:
             legacy_filename=f"{base_name}_attrs.json",
         )
 
-        if not isinstance(self.cfg.n_attributes_per_run, int) or self.cfg.n_attributes_per_run < 1:
-            raise ValueError("n_attributes_per_run must be an integer >= 1")
-
         label_items = list(self.cfg.labels.items())
+        label_batch_items, effective_n_attributes_per_run = resolve_attribute_batches(
+            task_name="Classify",
+            items=label_items,
+            requested_n=self.cfg.n_attributes_per_run,
+            metadata=run_metadata,
+            reset_files=reset_files,
+            checkpoint_paths=[csv_path],
+        )
+        label_batches: List[Dict[str, str]] = [dict(batch) for batch in label_batch_items]
         label_count = len(label_items)
-        if label_count > self.cfg.n_attributes_per_run:
+        if (
+            effective_n_attributes_per_run is not None
+            and label_count > effective_n_attributes_per_run
+        ):
             batches = (
-                label_count + self.cfg.n_attributes_per_run - 1
-            ) // self.cfg.n_attributes_per_run
+                label_count + effective_n_attributes_per_run - 1
+            ) // effective_n_attributes_per_run
             print(
-                f"[Classify] {label_count} labels provided. n_attributes_per_run={self.cfg.n_attributes_per_run}. "
-                f"Splitting into {batches} prompt batches. Increase n_attributes_per_run if you want all attributes "
-                "to be processed in the same prompt."
+                f"[Classify] {label_count} labels provided. n_attributes_per_run={effective_n_attributes_per_run}. "
+                f"Splitting into {batches} prompt batches; set n_attributes_per_run=None to process them together."
             )
-        label_batches: List[Dict[str, str]] = [
-            dict(label_items[i : i + self.cfg.n_attributes_per_run])
-            for i in range(0, len(label_items), self.cfg.n_attributes_per_run)
-        ]
+        write_task_run_metadata(
+            save_dir=self.cfg.save_dir,
+            base_name=base_name,
+            task_name="Classify",
+            model=self.cfg.model,
+            identifier_hash_bits=identifier_hash_bits,
+            n_attributes_per_run=effective_n_attributes_per_run,
+            attribute_batches=label_batch_items,
+        )
 
         prompts: List[str] = []
         ids: List[str] = []
@@ -223,15 +252,15 @@ class Classify:
             )
             for row, (circ, sq) in enumerate(zip(circles, squares)):
                 clean = " ".join(str(circ).split()) + "|" + " ".join(str(sq).split())
-                sha8 = hashlib.sha1(clean.encode()).hexdigest()[:8]
-                id_to_rows[sha8].append(row)
-                if len(id_to_rows[sha8]) > 1:
+                ident = hash_identifier(clean, bits=identifier_hash_bits)
+                id_to_rows[ident].append(row)
+                if len(id_to_rows[ident]) > 1:
                     continue
-                id_to_val[sha8] = (circ, sq)
-                prompt_circles[sha8] = (
+                id_to_val[ident] = (circ, sq)
+                prompt_circles[ident] = (
                     circ if self.cfg.modality in {"text", "entity", "web"} else ""
                 )
-                prompt_squares[sha8] = (
+                prompt_squares[ident] = (
                     sq if self.cfg.modality in {"text", "entity", "web"} else ""
                 )
                 circle_first_flag = (
@@ -239,8 +268,8 @@ class Classify:
                     if self.cfg.circle_first is not None
                     else random.random() < 0.5
                 )
-                id_to_circle_first[sha8] = circle_first_flag
-                base_ids.append(sha8)
+                id_to_circle_first[ident] = circle_first_flag
+                base_ids.append(ident)
             announce_prompt_rendering(
                 "Classify",
                 len(base_ids) * len(label_batches),
@@ -264,17 +293,17 @@ class Classify:
             warn_if_modality_mismatch(values, self.cfg.modality, column_name=str(column_name))
             for row, val in enumerate(values):
                 clean = " ".join(str(val).split())
-                sha8 = hashlib.sha1(clean.encode()).hexdigest()[:8]
-                id_to_rows[sha8].append(row)
-                if len(id_to_rows[sha8]) > 1:
+                ident = hash_identifier(clean, bits=identifier_hash_bits)
+                id_to_rows[ident].append(row)
+                if len(id_to_rows[ident]) > 1:
                     continue
-                id_to_val[sha8] = values[row]
-                prompt_texts[sha8] = (
+                id_to_val[ident] = values[row]
+                prompt_texts[ident] = (
                     str(values[row])
                     if self.cfg.modality in {"text", "entity", "web"}
                     else ""
                 )
-                base_ids.append(sha8)
+                base_ids.append(ident)
             announce_prompt_rendering(
                 "Classify",
                 len(base_ids) * len(label_batches),
@@ -367,8 +396,6 @@ class Classify:
                     for batch_idx in range(len(label_batches)):
                         tmp_p[f"{ident}_batch{batch_idx}"] = pdfs
             prompt_pdfs = tmp_p or None
-
-        csv_path = os.path.join(self.cfg.save_dir, f"{base_name}_raw_responses.csv")
 
         kwargs.setdefault("web_search", self.cfg.modality == "web")
         kwargs.setdefault("search_context_size", self.cfg.search_context_size)

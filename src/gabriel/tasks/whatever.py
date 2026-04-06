@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Union
@@ -12,6 +11,12 @@ import pandas as pd
 from ..utils import load_audio_inputs, load_image_inputs
 from ..utils.openai_utils import get_all_responses, response_to_text
 from ..utils.parsing import safe_json
+from ._run_utils import (
+    hash_identifier,
+    load_run_metadata,
+    resolve_identifier_hash_bits,
+    write_task_run_metadata,
+)
 
 
 @dataclass
@@ -42,7 +47,10 @@ class Whatever:
     # ------------------------------------------------------------------
     @staticmethod
     def _generate_identifiers(
-        prompts: List[str], provided: Optional[List[str]] = None
+        prompts: List[str],
+        provided: Optional[List[str]] = None,
+        *,
+        identifier_hash_bits: int = 64,
     ) -> List[str]:
         if provided is not None:
             if len(provided) != len(prompts):
@@ -55,7 +63,7 @@ class Whatever:
         counts: Dict[str, int] = {}
         generated: List[str] = []
         for prompt in prompts:
-            key = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
+            key = hash_identifier(prompt, bits=identifier_hash_bits)
             idx = counts.get(key, 0)
             counts[key] = idx + 1
             ident = key if idx == 0 else f"{key}-{idx}"
@@ -163,6 +171,30 @@ class Whatever:
 
         df_filters: Optional[Dict[str, Dict[str, Any]]] = None
         global_filters: Optional[Dict[str, Any]] = filters_spec or None
+        save_path = kwargs.pop(
+            "save_path", os.path.join(self.cfg.save_dir, self.cfg.file_name)
+        )
+        expanded_save_path = os.path.expandvars(os.path.expanduser(save_path))
+        metadata_dir = os.path.dirname(expanded_save_path) or self.cfg.save_dir
+        base_name = os.path.splitext(os.path.basename(expanded_save_path))[0]
+        run_metadata = load_run_metadata(
+            metadata_dir, base_name, reset_files=reset_files
+        )
+        identifier_hash_bits = resolve_identifier_hash_bits(
+            task_name="Whatever",
+            metadata=run_metadata,
+            reset_files=reset_files,
+            checkpoint_paths=[expanded_save_path],
+        )
+        write_task_run_metadata(
+            save_dir=metadata_dir,
+            base_name=base_name,
+            task_name="Whatever",
+            model=self.cfg.model,
+            identifier_hash_bits=identifier_hash_bits,
+            n_attributes_per_run=None,
+            attribute_batches=[],
+        )
 
         source_data = df if df is not None else prompts
         if source_data is None:
@@ -189,7 +221,10 @@ class Whatever:
                 if len(set(identifiers_list)) != len(identifiers_list):
                     raise ValueError("identifier_column must contain unique values")
             else:
-                identifiers_list = self._generate_identifiers(prompt_values)
+                identifiers_list = self._generate_identifiers(
+                    prompt_values,
+                    identifier_hash_bits=identifier_hash_bits,
+                )
 
             df_proc["_gid"] = identifiers_list
 
@@ -255,7 +290,9 @@ class Whatever:
             else:
                 prompts_list = [str(p) for p in source_data]
             identifiers_list = self._generate_identifiers(
-                prompts_list, identifiers
+                prompts_list,
+                identifiers,
+                identifier_hash_bits=identifier_hash_bits,
             )
             image_map = {}
             audio_map = {}
@@ -277,10 +314,6 @@ class Whatever:
 
         images_payload = image_map or None
         audio_payload = audio_map or None
-
-        save_path = kwargs.pop(
-            "save_path", os.path.join(self.cfg.save_dir, self.cfg.file_name)
-        )
 
         web_search_flag = (
             self.cfg.web_search

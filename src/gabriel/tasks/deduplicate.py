@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -21,6 +20,14 @@ from ..utils import (
     warn_if_modality_mismatch,
 )
 from ..utils.logging import announce_prompt_rendering
+from ._run_utils import (
+    DEFAULT_IDENTIFIER_HASH_BITS,
+    LEGACY_IDENTIFIER_HASH_BITS,
+    hash_identifier,
+    load_run_metadata,
+    resolve_identifier_hash_bits,
+    write_task_run_metadata,
+)
 
 
 @dataclass
@@ -250,6 +257,48 @@ class Deduplicate:
 
         df_proc = df.reset_index(drop=True).copy()
         n_runs = nruns if nruns is not None else self.cfg.n_runs
+        base_name = os.path.splitext(self.cfg.file_name)[0]
+        ext = os.path.splitext(self.cfg.file_name)[1]
+        checkpoint_paths = [
+            os.path.join(
+                self.cfg.save_dir,
+                f"{base_name}_run{i + 1}{ext}" if n_runs > 1 else self.cfg.file_name,
+            )
+            for i in range(max(1, n_runs))
+        ]
+        run_metadata = load_run_metadata(
+            self.cfg.save_dir, base_name, reset_files=reset_files
+        )
+        if (
+            not reset_files
+            and not run_metadata
+            and any(os.path.exists(path) for path in checkpoint_paths)
+        ):
+            identifier_hash_bits = LEGACY_IDENTIFIER_HASH_BITS
+            print(
+                "[Deduplicate] Existing response files found; using legacy "
+                "32-bit text IDs so this save_dir resumes. On large datasets, "
+                "these IDs collide more often; use reset_files=True "
+                "or a new save_dir to switch to 16-char IDs."
+            )
+        else:
+            identifier_hash_bits = resolve_identifier_hash_bits(
+                task_name="Deduplicate",
+                metadata=run_metadata,
+                reset_files=reset_files,
+                checkpoint_paths=checkpoint_paths,
+            )
+        if identifier_hash_bits not in {LEGACY_IDENTIFIER_HASH_BITS, DEFAULT_IDENTIFIER_HASH_BITS}:
+            identifier_hash_bits = DEFAULT_IDENTIFIER_HASH_BITS
+        write_task_run_metadata(
+            save_dir=self.cfg.save_dir,
+            base_name=base_name,
+            task_name="Deduplicate",
+            model=self.cfg.model,
+            identifier_hash_bits=identifier_hash_bits,
+            n_attributes_per_run=None,
+            attribute_batches=[],
+        )
         values = df_proc[column_name].tolist()
         warn_if_modality_mismatch(values, self.cfg.modality, column_name=column_name)
         current_col = column_name
@@ -272,10 +321,10 @@ class Deduplicate:
                     truncated.append(None)
                     continue
                 text = str(value)
-                sha8 = hashlib.sha1(text.encode()).hexdigest()[:8]
-                ids.append(sha8)
-                if sha8 not in id_to_original:
-                    id_to_original[sha8] = value
+                ident = hash_identifier(text, bits=identifier_hash_bits)
+                ids.append(ident)
+                if ident not in id_to_original:
+                    id_to_original[ident] = value
                 words = text.split()
                 if len(words) > self.cfg.max_words_per_text:
                     truncated_count += 1
@@ -283,7 +332,7 @@ class Deduplicate:
                 else:
                     clipped = text
                 truncated.append(clipped)
-                raw_texts[sha8] = clipped
+                raw_texts[ident] = clipped
             df_proc["_dedup_id"] = ids
             df_proc[f"{column_name}_truncated"] = truncated
             total = sum(1 for v in values if not pd.isna(v))

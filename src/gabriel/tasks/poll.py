@@ -16,6 +16,12 @@ from gabriel.utils.file_utils import save_dataframe_with_fallback
 from gabriel.utils.logging import announce_prompt_rendering
 from gabriel.utils.openai_utils import get_all_responses, response_to_text
 from gabriel.utils.parsing import safe_json
+from ._run_utils import (
+    hash_identifier,
+    load_run_metadata,
+    resolve_identifier_hash_bits,
+    write_task_run_metadata,
+)
 
 
 @dataclass
@@ -451,7 +457,29 @@ class Poll:
             f"{seed}\n\n<persona>\n{persona}" if seed else f"<persona>\n{persona}"
             for seed, persona in zip(seed_texts, persona_texts)
         ]
-        base_ids, row_ids, _ = self._build_unique_text_index(combined)
+        raw_path = os.path.join(self.cfg.save_dir, "poll_answers_raw_responses.csv")
+        run_metadata = load_run_metadata(
+            self.cfg.save_dir, "poll_answers", reset_files=reset_files
+        )
+        identifier_hash_bits = resolve_identifier_hash_bits(
+            task_name="Poll",
+            metadata=run_metadata,
+            reset_files=reset_files,
+            checkpoint_paths=[raw_path],
+        )
+        write_task_run_metadata(
+            save_dir=self.cfg.save_dir,
+            base_name="poll_answers",
+            task_name="Poll",
+            model=self.cfg.poll_model,
+            identifier_hash_bits=identifier_hash_bits,
+            n_attributes_per_run=None,
+            attribute_batches=[],
+        )
+        base_ids, row_ids, _ = self._build_unique_text_index(
+            combined,
+            identifier_hash_bits=identifier_hash_bits,
+        )
         first_rows: Dict[str, int] = {}
         for row_idx, ident in enumerate(row_ids):
             first_rows.setdefault(ident, row_idx)
@@ -474,7 +502,6 @@ class Poll:
                     )
                 )
 
-        raw_path = os.path.join(self.cfg.save_dir, "poll_answers_raw_responses.csv")
         df_resp = await self._dispatch_responses(
             prompts=prompts,
             identifiers=identifiers,
@@ -738,13 +765,15 @@ Enforce realism and representativeness across all persona dimensions, and allow 
     @staticmethod
     def _build_unique_text_index(
         values: Sequence[str],
+        *,
+        identifier_hash_bits: int = 64,
     ) -> tuple[List[str], List[str], Dict[str, str]]:
         base_ids: List[str] = []
         row_ids: List[str] = []
         id_to_text: Dict[str, str] = {}
         seen: set[str] = set()
         for text in values:
-            ident = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+            ident = hash_identifier(text, bits=identifier_hash_bits)
             row_ids.append(ident)
             if ident in seen:
                 continue
