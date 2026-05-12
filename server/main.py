@@ -135,6 +135,7 @@ class RateRequest(RuntimeTuningRequest):
     attributes: dict[str, str]
     model: str = "gpt-5.4-mini"
     n_runs: int | None = None
+    n_attributes_per_run: int | None = None
 
 
 class RateResult(BaseModel):
@@ -148,6 +149,7 @@ class ClassifyRequest(RuntimeTuningRequest):
     multi_label: bool = False
     model: str = "gpt-5.4-mini"
     n_runs: int | None = None
+    n_attributes_per_run: int | None = None
 
 
 class ClassifyResult(BaseModel):
@@ -170,6 +172,7 @@ class ExtractRequest(RuntimeTuningRequest):
     fields: dict[str, str]
     model: str = "gpt-5.4-mini"
     n_runs: int | None = None
+    n_attributes_per_run: int | None = None
 
 
 class ExtractResult(BaseModel):
@@ -274,10 +277,12 @@ async def rate(request: RateRequest) -> list[RateResult]:
     )
     if request.n_runs is not None:
         kwargs["n_runs"] = request.n_runs
+    if request.n_attributes_per_run is not None:
+        kwargs["n_attributes_per_run"] = request.n_attributes_per_run
     kwargs.update(
         _runtime_overrides(
             request,
-            {"texts", "attributes", "model", "n_runs"},
+            {"texts", "attributes", "model", "n_runs", "n_attributes_per_run"},
         )
     )
     _apply_safe_runtime_defaults(kwargs)
@@ -307,10 +312,12 @@ async def classify(request: ClassifyRequest) -> list[ClassifyResult]:
     )
     if request.n_runs is not None:
         kwargs["n_runs"] = request.n_runs
+    if request.n_attributes_per_run is not None:
+        kwargs["n_attributes_per_run"] = request.n_attributes_per_run
     kwargs.update(
         _runtime_overrides(
             request,
-            {"texts", "labels", "multi_label", "model", "n_runs"},
+            {"texts", "labels", "multi_label", "model", "n_runs", "n_attributes_per_run"},
         )
     )
     _apply_safe_runtime_defaults(kwargs)
@@ -376,10 +383,12 @@ async def extract(request: ExtractRequest) -> list[ExtractResult]:
     )
     if request.n_runs is not None:
         kwargs["n_runs"] = request.n_runs
+    if request.n_attributes_per_run is not None:
+        kwargs["n_attributes_per_run"] = request.n_attributes_per_run
     kwargs.update(
         _runtime_overrides(
             request,
-            {"texts", "fields", "model", "n_runs"},
+            {"texts", "fields", "model", "n_runs", "n_attributes_per_run"},
         )
     )
     _apply_safe_runtime_defaults(kwargs)
